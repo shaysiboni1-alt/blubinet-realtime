@@ -1,14 +1,17 @@
 {
-  "name": "misterbot-realtime",
+  "name": "blubinet-realtime",
   "version": "1.0.0",
-  "description": "Twilio <-> OpenAI Realtime voice bridge for MisterBot",
+  "description": "BluBinet realtime voice bot using Twilio Media Streams + OpenAI Realtime API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.0",
-    "ws": "^8.16.0",
-    "node-fetch": "^2.7.0"
+    "express": "^4.19.2",
+    "ws": "^8.18.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
