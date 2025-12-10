@@ -1,0 +1,14 @@
+{
+  "name": "misterbot-realtime",
+  "version": "1.0.0",
+  "description": "Twilio <-> OpenAI Realtime voice bridge for MisterBot",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.0",
+    "ws": "^8.16.0",
+    "node-fetch": "^2.7.0"
+  }
+}
