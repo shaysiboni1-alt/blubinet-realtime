@@ -1,8 +1,7 @@
 // server.js
 //
-// MisterBot Realtime Voice Bot – "נטע"
+// BluBinet Realtime Voice Bot – "נטע"
 // Twilio Media Streams <-> OpenAI Realtime API (gpt-4o-realtime-preview-2024-12-17)
-//
 //
 // חוקים עיקריים לפי ה-MASTER PROMPT:
 // - שיחה בעברית כברירת מחדל, לשון רבים, טון חם וקצר.
@@ -51,15 +50,15 @@ if (!OPENAI_API_KEY) {
 }
 
 const BOT_NAME = process.env.MB_BOT_NAME || 'נטע';
-const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || 'MisterBot';
+const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || 'BluBinet';
 
 const MB_OPENING_SCRIPT =
   process.env.MB_OPENING_SCRIPT ||
-  'שלום, הגעתם למיסטר בוט – פתרונות בינה מלאכותית ובוטים קוליים לעסקים. שמי נטע, איך אפשר לעזור לכם היום?';
+  'שלום, הגעתם ל-BluBinet – פתרונות טלפוניה חכמים בענן לעסקים. שמי נטע, איך אפשר לעזור לכם היום?';
 
 const MB_CLOSING_SCRIPT =
   process.env.MB_CLOSING_SCRIPT ||
-  'תודה שדיברתם עם מיסטר בוט, יום נעים ולהתראות.';
+  'תודה שדיברתם עם BluBinet. נציג יחזור אליכם בהקדם. יום נעים!';
 
 const MB_GENERAL_PROMPT = process.env.MB_GENERAL_PROMPT || '';
 const MB_BUSINESS_PROMPT = process.env.MB_BUSINESS_PROMPT || '';
@@ -271,7 +270,6 @@ function normalizePhoneNumber(rawPhone, callerNumber) {
 // MB_GENERAL_PROMPT + (אופציונלי) MB_BUSINESS_PROMPT + dynamicBusinessPrompt.
 // אין יותר "פרומפט ענק" קשיח בתוך הקוד.
 //
-
 // חוקים קבועים למודל – כדי שלא ידבר על רעשי רקע ושלא יסיים שיחה לבד לפי מילים
 const EXTRA_BEHAVIOR_RULES = `
 חוקי מערכת קבועים (גבוהים מהפרומפט העסקי):
@@ -1268,7 +1266,7 @@ wss.on('connection', (connection, req) => {
 // Start server
 // -----------------------------
 server.listen(PORT, () => {
-  console.log(`✅ MisterBot Realtime Voice Bot running on port ${PORT}`);
+  console.log(`✅ BluBinet Realtime Voice Bot running on port ${PORT}`);
   // ריענון KB דינאמי פעם אחת בהפעלה
   refreshDynamicBusinessPrompt('Startup').catch((err) =>
     console.error('[ERROR][DynamicKB] initial load failed', err)
