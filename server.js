@@ -78,7 +78,7 @@ const TTS_PROVIDER = (process.env.TTS_PROVIDER || 'openai').toLowerCase();
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || '';
 const ELEVEN_VOICE_ID =
   process.env.ELEVEN_VOICE_ID || process.env.VOICE_ID || '';
-const ELEVEN_TTS_MODEL = process.env.ELEVEN_TTS_MODEL || 'Eleven V3';
+const ELEVEN_TTS_MODEL = process.env.ELEVEN_TTS_MODEL || 'eleven_v3';
 const ELEVEN_OUTPUT_FORMAT =
   process.env.ELEVEN_OUTPUT_FORMAT || 'ulaw_8000';
 const ELEVEN_OPTIMIZE_LATENCY = envNumber('ELEVEN_OPTIMIZE_LATENCY', 3);
@@ -120,13 +120,13 @@ const MB_IDLE_HANGUP_MS = envNumber('MB_IDLE_HANGUP_MS', 90000); // 90 שניו�
 const MB_MAX_CALL_MS = envNumber('MB_MAX_CALL_MS', 5 * 60 * 1000);
 const MB_MAX_WARN_BEFORE_MS = envNumber('MB_MAX_WARN_BEFORE_MS', 45000); // 45 שניות לפני הסוף
 // כמה זמן אחרי הסגיר לנתק בכוח
-const MB_HANGUP_GRACE_MS = envNumber('MB_HANGUP_GRACE_MS', 5000);
+const MB_HANGUP_GRACE_MS = envNumber('MB_HANGUP_GRACE_MS', 3000);
 
 // האם מותר ללקוח לקטוע את הבוט (barge-in)
-const MB_ALLOW_BARGE_IN = envBool('MB_ALLOW_BARGE_IN', false);
+const MB_ALLOW_BARGE_IN = envBool('MB_ALLOW_BARGE_IN', true);
 
 // Tail שבו עדיין לא מקשיבים אחרי שהבוט סיים לדבר (מילישניות)
-const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 1600);
+const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 900);
 
 // לידים / וובהוק
 const MB_ENABLE_LEAD_CAPTURE = envBool('MB_ENABLE_LEAD_CAPTURE', false);
@@ -154,7 +154,9 @@ console.log(
   )}`
 );
 console.log(
-  `[CONFIG] TTS_PROVIDER=${TTS_PROVIDER}, ELEVEN_VOICE_ID=${ELEVEN_VOICE_ID ? 'SET' : 'EMPTY'}`
+  `[CONFIG] TTS_PROVIDER=${TTS_PROVIDER}, ELEVEN_VOICE_ID=${
+    ELEVEN_VOICE_ID ? 'SET' : 'EMPTY'
+  }`
 );
 
 // -----------------------------
@@ -709,15 +711,28 @@ wss.on('connection', (connection, req) => {
       }
 
       const arrBuf = await res.arrayBuffer();
-      const audioBuffer = Buffer.from(arrBuf);
+      let audioBuffer = Buffer.from(arrBuf);
       logInfo(
         tag,
         `ElevenLabs TTS audio received. length=${audioBuffer.length} bytes`
       );
 
+      // *** חשוב: אם חזר WAV עם כותרת RIFF – חותכים את ה־Header (44 בייט) ***
+      if (
+        audioBuffer.length > 4 &&
+        audioBuffer.toString('ascii', 0, 4) === 'RIFF'
+      ) {
+        logInfo(
+          tag,
+          'Detected RIFF/WAV header from ElevenLabs – stripping first 44 bytes.'
+        );
+        audioBuffer = audioBuffer.subarray(44);
+      }
+
       botSpeaking = true;
 
-      const chunkSize = 320; // בערך ~40ms ב-8kHz
+      // בכל frame: 160 בייט (20ms ב־8kHz μ-law)
+      const chunkSize = 160;
       const chunkDelayMs = 20;
 
       for (
@@ -1141,7 +1156,6 @@ wss.on('connection', (connection, req) => {
       instructions
     };
 
-    // אם אנחנו עובדים עם OpenAI TTS – נגדיר voice + output_audio_format
     if (TTS_PROVIDER !== 'eleven') {
       session.voice = OPENAI_VOICE;
       session.output_audio_format = 'g711_ulaw';
@@ -1203,7 +1217,6 @@ wss.on('connection', (connection, req) => {
           logInfo('Bot', text);
           checkBotClosing(text);
 
-          // אם אנחנו על Eleven – זה המקום לייצר אודיו
           if (TTS_PROVIDER === 'eleven') {
             playTtsWithEleven(text).catch((err) =>
               logError(tag, 'playTtsWithEleven error', err)
@@ -1214,10 +1227,8 @@ wss.on('connection', (connection, req) => {
         break;
       }
 
-      // אודיו מהמודל → לטוויליו (רק כשמשתמשים ב-TTS של OpenAI)
       case 'response.audio.delta': {
         if (TTS_PROVIDER === 'eleven') {
-          // כשעובדים עם Eleven – מתעלמים מהאודיו של OpenAI
           break;
         }
 
