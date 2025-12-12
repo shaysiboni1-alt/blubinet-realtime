@@ -82,6 +82,19 @@ const ELEVENLABS_LANGUAGE =
   process.env.ELEVEN_LANGUAGE ||
   'he';
 
+// stability – חובה להיות 0 / 0.5 / 1.0 ב-eleven_v3
+const ELEVENLABS_STABILITY_RAW = process.env.ELEVENLABS_STABILITY;
+let ELEVENLABS_STABILITY = 0.5; // ברירת מחדל: Natural
+
+if (ELEVENLABS_STABILITY_RAW !== undefined) {
+  const v = Number(ELEVENLABS_STABILITY_RAW);
+  if (Number.isFinite(v)) {
+    if (v <= 0.25) ELEVENLABS_STABILITY = 0.0;
+    else if (v <= 0.75) ELEVENLABS_STABILITY = 0.5;
+    else ELEVENLABS_STABILITY = 1.0;
+  }
+}
+
 // פורמט שכתוב ב-ENV (לוג בלבד)
 const RAW_ELEVEN_OUTPUT_FORMAT =
   process.env.ELEVEN_OUTPUT_FORMAT ||
@@ -161,7 +174,7 @@ console.log(
 console.log(
   `[CONFIG] TTS_PROVIDER=${TTS_PROVIDER}, ELEVEN_VOICE_ID=${
     ELEVEN_VOICE_ID ? 'SET' : 'MISSING'
-  }, ELEVEN_TTS_MODEL=${ELEVEN_TTS_MODEL}, ELEVEN_OUTPUT_FORMAT=${ELEVEN_OUTPUT_FORMAT}, ELEVENLABS_LANGUAGE=${ELEVENLABS_LANGUAGE}, RAW_OUTPUT_FORMAT=${RAW_ELEVEN_OUTPUT_FORMAT}`
+  }, ELEVEN_TTS_MODEL=${ELEVEN_TTS_MODEL}, ELEVEN_OUTPUT_FORMAT=${ELEVEN_OUTPUT_FORMAT}, ELEVENLABS_LANGUAGE=${ELEVENLABS_LANGUAGE}, RAW_OUTPUT_FORMAT=${RAW_ELEVEN_OUTPUT_FORMAT}, ELEVENLABS_STABILITY=${ELEVENLABS_STABILITY}`
 );
 
 // -----------------------------
@@ -601,7 +614,7 @@ async function elevenSpeakToTwilio(text, connection, streamSid) {
       text,
       model_id: ELEVEN_TTS_MODEL,
       voice_settings: {
-        stability: 0.4,
+        stability: ELEVENLABS_STABILITY,          // ✔ ערך חוקי 0/0.5/1
         similarity_boost: 0.9,
         style: 0.3,
         use_speaker_boost: true,
@@ -614,7 +627,8 @@ async function elevenSpeakToTwilio(text, connection, streamSid) {
       length: text.length,
       model: ELEVEN_TTS_MODEL,
       language: ELEVENLABS_LANGUAGE,
-      format: ELEVEN_OUTPUT_FORMAT
+      format: ELEVEN_OUTPUT_FORMAT,
+      stability: ELEVENLABS_STABILITY
     });
 
     const res = await fetch(url, {
@@ -1094,7 +1108,6 @@ wss.on('connection', (connection, req) => {
 
     const effectiveSilenceMs = MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS;
 
-    // ‼️ כאן החזרנו את ההגדרה למצב הקודם – תמיד AUDIO+TEXT + voice
     const sessionUpdate = {
       type: 'session.update',
       session: {
