@@ -1094,29 +1094,25 @@ wss.on('connection', (connection, req) => {
 
     const effectiveSilenceMs = MB_VAD_SILENCE_MS + MB_VAD_SUFFIX_MS;
 
-    const session = {
-      model: 'gpt-4o-realtime-preview-2024-12-17',
-      modalities: TTS_PROVIDER === 'eleven' ? ['text'] : ['audio', 'text'],
-      input_audio_format: 'g711_ulaw',
-      input_audio_transcription: { model: 'whisper-1' },
-      turn_detection: {
-        type: 'server_vad',
-        threshold: MB_VAD_THRESHOLD,
-        silence_duration_ms: effectiveSilenceMs,
-        prefix_padding_ms: MB_VAD_PREFIX_MS
-      },
-      max_response_output_tokens: MAX_OUTPUT_TOKENS,
-      instructions
-    };
-
-    if (TTS_PROVIDER !== 'eleven') {
-      session.voice = OPENAI_VOICE;
-      session.output_audio_format = 'g711_ulaw';
-    }
-
+    // ‼️ כאן החזרנו את ההגדרה למצב הקודם – תמיד AUDIO+TEXT + voice
     const sessionUpdate = {
       type: 'session.update',
-      session
+      session: {
+        model: 'gpt-4o-realtime-preview-2024-12-17',
+        modalities: ['audio', 'text'],
+        voice: OPENAI_VOICE,
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw',
+        input_audio_transcription: { model: 'whisper-1' },
+        turn_detection: {
+          type: 'server_vad',
+          threshold: MB_VAD_THRESHOLD,
+          silence_duration_ms: effectiveSilenceMs,
+          prefix_padding_ms: MB_VAD_PREFIX_MS
+        },
+        max_response_output_tokens: MAX_OUTPUT_TOKENS,
+        instructions
+      }
     };
 
     logDebug(tag, 'Sending session.update to OpenAI.', sessionUpdate);
@@ -1182,7 +1178,7 @@ wss.on('connection', (connection, req) => {
       }
 
       case 'response.audio.delta': {
-        // אם TTS_PROVIDER=eleven – לא רוצים אודיו מ-OpenAI בכלל
+        // אם TTS_PROVIDER=eleven – מתעלמים מאודיו של OpenAI (לא רוצים כפול)
         if (TTS_PROVIDER === 'eleven') break;
 
         const b64 = msg.delta;
