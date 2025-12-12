@@ -69,7 +69,7 @@ const MB_LANGUAGES = (process.env.MB_LANGUAGES || 'he,en,ru,ar')
   .filter(Boolean);
 
 // מהירות דיבור כללית (נשתמש ב-Eleven)
-const MB_SPEECH_SPEED = envNumber('MB_SPEECH_SPEED', 1.0);
+const MB_SPEECH_SPEED = envNumber('MB_SPEECH_SPEED', 0.95);
 
 // TTS provider
 const TTS_PROVIDER = (process.env.TTS_PROVIDER || 'openai').toLowerCase();
@@ -79,10 +79,12 @@ const OPENAI_VOICE = process.env.OPENAI_VOICE || 'alloy';
 
 // ElevenLabs config
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || '';
-// לוקח קודם ELEVEN_VOICE_ID, ואם אין – VOICE_ID (כמו אצלך עכשיו)
+// קודם ELEVEN_VOICE_ID, ואם אין – VOICE_ID כמו שהיה לך
 const ELEVEN_VOICE_ID =
   process.env.ELEVEN_VOICE_ID || process.env.VOICE_ID || '';
-const ELEVEN_TTS_MODEL = process.env.ELEVEN_TTS_MODEL || 'eleven_multilingual_v2';
+// ברירת מחדל: v1 (אם תרצה – תגדיר ב-ENV מודל אחר)
+const ELEVEN_TTS_MODEL = process.env.ELEVEN_TTS_MODEL || 'eleven_multilingual_v1';
+// חשוב: לטוויליו חייבים פורמט טלפוניה (לא MP3!)
 const ELEVEN_OUTPUT_FORMAT =
   process.env.ELEVEN_OUTPUT_FORMAT || 'ulaw_8000';
 
@@ -156,7 +158,7 @@ console.log(
 console.log(
   `[CONFIG] TTS_PROVIDER=${TTS_PROVIDER}, ELEVEN_VOICE_ID=${
     ELEVEN_VOICE_ID ? 'SET' : 'MISSING'
-  }`
+  }, ELEVEN_TTS_MODEL=${ELEVEN_TTS_MODEL}, ELEVEN_OUTPUT_FORMAT=${ELEVEN_OUTPUT_FORMAT}`
 );
 
 // -----------------------------
@@ -1015,9 +1017,7 @@ wss.on('connection', (connection, req) => {
       const audioBuf = Buffer.from(arrayBuf);
       logInfo(ttsTag, `ElevenLabs TTS audio received. length=${audioBuf.length} bytes`);
 
-      // ulaw_8000 = 8000 דגימות בשנייה, 1 בייט לדגימה
-      // Twilio משתמש בדרך-כלל ב-20ms = 160 בייט
-      const CHUNK_SIZE = 160;
+      const CHUNK_SIZE = 160; // 20ms ב-8kHz μ-law
 
       for (let offset = 0; offset < audioBuf.length; offset += CHUNK_SIZE) {
         const chunk = audioBuf.subarray(offset, offset + CHUNK_SIZE);
@@ -1051,8 +1051,10 @@ wss.on('connection', (connection, req) => {
 
     const session = {
       model: 'gpt-4o-realtime-preview-2024-12-17',
-      modalities: useOpenAiAudio ? ['audio', 'text'] : ['text'],
+      modalities: ['audio', 'text'],
+      voice: OPENAI_VOICE,
       input_audio_format: 'g711_ulaw',
+      output_audio_format: 'g711_ulaw',
       input_audio_transcription: { model: 'whisper-1' },
       turn_detection: {
         type: 'server_vad',
@@ -1064,11 +1066,6 @@ wss.on('connection', (connection, req) => {
       instructions
     };
 
-    if (useOpenAiAudio) {
-      session.voice = OPENAI_VOICE;
-      session.output_audio_format = 'g711_ulaw';
-    }
-
     const sessionUpdate = {
       type: 'session.update',
       session
@@ -1078,6 +1075,7 @@ wss.on('connection', (connection, req) => {
     openAiWs.send(JSON.stringify(sessionUpdate));
 
     const greetingText = MB_OPENING_SCRIPT;
+    logInfo(tag, 'Sending model prompt (opening_greeting)');
     sendModelPrompt(
       `פתחי את השיחה עם הלקוח במשפט הבא (אפשר לשנות מעט את הניסוח אבל לא להאריך): "${greetingText}" ואז עצרי והמתיני לתשובה שלו.`,
       'opening_greeting'
@@ -1111,8 +1109,7 @@ wss.on('connection', (connection, req) => {
       }
 
       case 'response.audio_transcript.delta': {
-        const delta = msg.delta || '';
-        if (useOpenAiAudio && delta) currentBotText += delta;
+        // לא חובה – מתעלמים
         break;
       }
 
@@ -1124,7 +1121,6 @@ wss.on('connection', (connection, req) => {
           logInfo('Bot', text);
           checkBotClosing(text);
           if (useEleven) {
-            // כאן אנחנו נותנים ל-Elevenlabs לדבר
             elevenSpeakToTwilio(text).catch((err) =>
               logError('ElevenTTS', 'Error in elevenSpeakToTwilio', err)
             );
@@ -1135,16 +1131,7 @@ wss.on('connection', (connection, req) => {
       }
 
       case 'response.audio_transcript.done': {
-        // במקרה של OpenAI audio – זה רק תמלול
-        if (!useOpenAiAudio) break;
-        if (!currentBotText) break;
-        const text = currentBotText.trim();
-        if (text) {
-          conversationLog.push({ from: 'bot', text });
-          logInfo('Bot', text);
-          checkBotClosing(text);
-        }
-        currentBotText = '';
+        // לא חייבים לעשות כלום כאן
         break;
       }
 
