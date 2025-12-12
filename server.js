@@ -2,6 +2,7 @@
 //
 // BluBinet Realtime Voice Bot – "נטע"
 // Twilio Media Streams <-> OpenAI Realtime API (gpt-4o-realtime-preview-2024-12-17)
+// עם תמיכה ב-TTS חיצוני של ElevenLabs (ulaw_8000 לטוויליו)
 //
 // חוקים עיקריים לפי ה-MASTER PROMPT:
 // - שיחה בעברית כברירת מחדל, לשון רבים, טון חם וקצר.
@@ -67,21 +68,23 @@ const MB_LANGUAGES = (process.env.MB_LANGUAGES || 'he,en,ru,ar')
   .map((s) => s.trim())
   .filter(Boolean);
 
-const MB_SPEECH_SPEED = envNumber('MB_SPEECH_SPEED', 1.15);
+// מהירות דיבור כללית (נשתמש ב-Eleven)
+const MB_SPEECH_SPEED = envNumber('MB_SPEECH_SPEED', 1.0);
 
-const OPENAI_VOICE = process.env.OPENAI_VOICE || 'alloy';
-
-// ---------- TTS provider (OpenAI / ElevenLabs) ----------
+// TTS provider
 const TTS_PROVIDER = (process.env.TTS_PROVIDER || 'openai').toLowerCase();
 
-// ElevenLabs ENV
+// OpenAI Voice (אם עובדים עם TTS שלהם)
+const OPENAI_VOICE = process.env.OPENAI_VOICE || 'alloy';
+
+// ElevenLabs config
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || '';
+// לוקח קודם ELEVEN_VOICE_ID, ואם אין – VOICE_ID (כמו אצלך עכשיו)
 const ELEVEN_VOICE_ID =
   process.env.ELEVEN_VOICE_ID || process.env.VOICE_ID || '';
-const ELEVEN_TTS_MODEL = process.env.ELEVEN_TTS_MODEL || 'eleven_v3';
+const ELEVEN_TTS_MODEL = process.env.ELEVEN_TTS_MODEL || 'eleven_multilingual_v2';
 const ELEVEN_OUTPUT_FORMAT =
   process.env.ELEVEN_OUTPUT_FORMAT || 'ulaw_8000';
-const ELEVEN_OPTIMIZE_LATENCY = envNumber('ELEVEN_OPTIMIZE_LATENCY', 3);
 
 // ניהול נכון של MAX_OUTPUT_TOKENS – תמיד מספר או "inf"
 const MAX_OUTPUT_TOKENS_ENV = process.env.MAX_OUTPUT_TOKENS;
@@ -120,23 +123,20 @@ const MB_IDLE_HANGUP_MS = envNumber('MB_IDLE_HANGUP_MS', 90000); // 90 שניו�
 const MB_MAX_CALL_MS = envNumber('MB_MAX_CALL_MS', 5 * 60 * 1000);
 const MB_MAX_WARN_BEFORE_MS = envNumber('MB_MAX_WARN_BEFORE_MS', 45000); // 45 שניות לפני הסוף
 // כמה זמן אחרי הסגיר לנתק בכוח
-const MB_HANGUP_GRACE_MS = envNumber('MB_HANGUP_GRACE_MS', 3000);
+const MB_HANGUP_GRACE_MS = envNumber('MB_HANGUP_GRACE_MS', 5000);
 
 // האם מותר ללקוח לקטוע את הבוט (barge-in)
-const MB_ALLOW_BARGE_IN = envBool('MB_ALLOW_BARGE_IN', true);
+const MB_ALLOW_BARGE_IN = envBool('MB_ALLOW_BARGE_IN', false);
 
 // Tail שבו עדיין לא מקשיבים אחרי שהבוט סיים לדבר (מילישניות)
-const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 900);
+const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 1600);
 
 // לידים / וובהוק
 const MB_ENABLE_LEAD_CAPTURE = envBool('MB_ENABLE_LEAD_CAPTURE', false);
 const MB_WEBHOOK_URL = process.env.MB_WEBHOOK_URL || '';
 
 // PARSING חכם ללידים
-const MB_ENABLE_SMART_LEAD_PARSING = envBool(
-  'MB_ENABLE_SMART_LEAD_PARSING',
-  true
-);
+const MB_ENABLE_SMART_LEAD_PARSING = envBool('MB_ENABLE_SMART_LEAD_PARSING', true);
 const MB_LEAD_PARSING_MODEL =
   process.env.MB_LEAD_PARSING_MODEL || 'gpt-4.1-mini';
 
@@ -155,7 +155,7 @@ console.log(
 );
 console.log(
   `[CONFIG] TTS_PROVIDER=${TTS_PROVIDER}, ELEVEN_VOICE_ID=${
-    ELEVEN_VOICE_ID ? 'SET' : 'EMPTY'
+    ELEVEN_VOICE_ID ? 'SET' : 'MISSING'
   }`
 );
 
@@ -175,18 +175,13 @@ const MB_DYNAMIC_KB_MIN_INTERVAL_MS = envNumber(
 async function refreshDynamicBusinessPrompt(tag = 'DynamicKB') {
   if (!MB_DYNAMIC_KB_URL) {
     if (MB_DEBUG) {
-      console.log(
-        `[DEBUG][${tag}] MB_DYNAMIC_KB_URL is empty – skip refresh.`
-      );
+      console.log(`[DEBUG][${tag}] MB_DYNAMIC_KB_URL is empty – skip refresh.`);
     }
     return;
   }
 
   const now = Date.now();
-  if (
-    tag !== 'Startup' &&
-    now - lastDynamicKbRefreshAt < MB_DYNAMIC_KB_MIN_INTERVAL_MS
-  ) {
+  if (tag !== 'Startup' && now - lastDynamicKbRefreshAt < MB_DYNAMIC_KB_MIN_INTERVAL_MS) {
     console.log(
       `[INFO][${tag}] Skipping dynamic KB refresh – refreshed ${
         now - lastDynamicKbRefreshAt
@@ -198,17 +193,13 @@ async function refreshDynamicBusinessPrompt(tag = 'DynamicKB') {
   try {
     const res = await fetch(MB_DYNAMIC_KB_URL);
     if (!res.ok) {
-      console.error(
-        `[ERROR][${tag}] Failed to fetch dynamic KB. HTTP ${res.status}`
-      );
+      console.error(`[ERROR][${tag}] Failed to fetch dynamic KB. HTTP ${res.status}`);
       return;
     }
     const text = (await res.text()).trim();
     dynamicBusinessPrompt = text;
     lastDynamicKbRefreshAt = Date.now();
-    console.log(
-      `[INFO][${tag}] Dynamic KB loaded. length=${text.length}`
-    );
+    console.log(`[INFO][${tag}] Dynamic KB loaded. length=${text.length}`);
   } catch (err) {
     console.error(`[ERROR][${tag}] Error fetching dynamic KB`, err);
   }
@@ -252,10 +243,7 @@ function normalizePhoneNumber(rawPhone, callerNumber) {
   }
 
   function normalize972(digits) {
-    if (
-      digits.startsWith('972') &&
-      (digits.length === 11 || digits.length === 12)
-    ) {
+    if (digits.startsWith('972') && (digits.length === 11 || digits.length === 12)) {
       return '0' + digits.slice(3);
     }
     return digits;
@@ -440,32 +428,25 @@ async function extractLeadFromConversation(conversationLog) {
 ${conversationText}
 `.trim();
 
-    const response = await fetch(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          model: MB_LEAD_PARSING_MODEL,
-          response_format: { type: 'json_object' },
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
-          ]
-        })
-      }
-    );
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: MB_LEAD_PARSING_MODEL,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ]
+      })
+    });
 
     if (!response.ok) {
       const text = await response.text().catch(() => '');
-      logError(
-        tag,
-        `OpenAI lead parsing HTTP ${response.status}`,
-        text
-      );
+      logError(tag, `OpenAI lead parsing HTTP ${response.status}`, text);
       return null;
     }
 
@@ -521,9 +502,7 @@ async function hangupTwilioCall(callSid, tag = 'Call') {
       headers: {
         Authorization:
           'Basic ' +
-          Buffer.from(
-            `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
-          ).toString('base64'),
+          Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'),
         'Content-Type': 'application/x-www-form-urlencoded'
       },
       body
@@ -563,19 +542,13 @@ async function fetchCallerNumberFromTwilio(callSid, tag = 'Call') {
       headers: {
         Authorization:
           'Basic ' +
-          Buffer.from(
-            `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
-          ).toString('base64')
+          Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64')
       }
     });
 
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
-      logError(
-        tag,
-        `fetchCallerNumberFromTwilio HTTP ${res.status}`,
-        txt
-      );
+      logError(tag, `fetchCallerNumberFromTwilio HTTP ${res.status}`, txt);
       return null;
     }
 
@@ -588,11 +561,7 @@ async function fetchCallerNumberFromTwilio(callSid, tag = 'Call') {
     );
     return fromRaw;
   } catch (err) {
-    logError(
-      tag,
-      'fetchCallerNumberFromTwilio: error fetching from Twilio',
-      err
-    );
+    logError(tag, 'fetchCallerNumberFromTwilio: error fetching from Twilio', err);
     return null;
   }
 }
@@ -634,153 +603,45 @@ wss.on('connection', (connection, req) => {
   let idleHangupScheduled = false;
   let maxCallTimeout = null;
   let maxCallWarningTimeout = null;
-  let pendingHangup = null; // { reason, closingMessage }
+  let pendingHangup = null;
   let openAiReady = false;
   let twilioClosed = false;
   let openAiClosed = false;
   let callEnded = false;
 
+  // מצב דיבור של הבוט (לצורך barge-in)
   let botSpeaking = false;
+
+  // האם יש response פעיל במודל
   let hasActiveResponse = false;
+
+  // דגל: האם זה עדיין "התור של הבוט"
   let botTurnActive = false;
+
+  // טיימסטמפ עד מתי אסור להקשיב ללקוח (זנב קצר אחרי סיום דיבור)
   let noListenUntilTs = 0;
 
+  // האם הלקוח כבר דיבר פעם אחת
   let userHasSpoken = false;
 
+  // האם וובהוק לידים כבר נשלח בשיחה הזו
   let leadWebhookSent = false;
 
-  // -----------------------------
-  // Helper: TTS via ElevenLabs
-  // -----------------------------
-  async function playTtsWithEleven(text) {
-    if (!text || !text.trim()) return;
-    if (TTS_PROVIDER !== 'eleven') return;
-    if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
-      logError(
-        tag,
-        'ElevenLabs TTS requested but ELEVEN_API_KEY or ELEVEN_VOICE_ID is missing.'
-      );
-      return;
-    }
-    if (!streamSid) {
-      logDebug(
-        tag,
-        'ElevenLabs TTS requested but streamSid is not set yet.'
-      );
-      return;
-    }
-    if (connection.readyState !== WebSocket.OPEN) {
-      logDebug(
-        tag,
-        'ElevenLabs TTS requested but Twilio WS is not open.'
-      );
-      return;
-    }
-
-    try {
-      logInfo(tag, 'Sending text to ElevenLabs TTS.', {
-        length: text.length
-      });
-
-      const res = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream`,
-        {
-          method: 'POST',
-          headers: {
-            'xi-api-key': ELEVEN_API_KEY,
-            'Content-Type': 'application/json',
-            Accept: 'audio/mulaw;codec=pcm;bit=8;rate=8000'
-          },
-          body: JSON.stringify({
-            text,
-            model_id: ELEVEN_TTS_MODEL,
-            output_format: ELEVEN_OUTPUT_FORMAT,
-            optimize_latency: ELEVEN_OPTIMIZE_LATENCY
-          })
-        }
-      );
-
-      if (!res.ok) {
-        const txt = await res.text().catch(() => '');
-        logError(
-          tag,
-          `ElevenLabs TTS HTTP ${res.status}`,
-          txt.slice(0, 500)
-        );
-        return;
-      }
-
-      const arrBuf = await res.arrayBuffer();
-      let audioBuffer = Buffer.from(arrBuf);
-      logInfo(
-        tag,
-        `ElevenLabs TTS audio received. length=${audioBuffer.length} bytes`
-      );
-
-      // *** חשוב: אם חזר WAV עם כותרת RIFF – חותכים את ה־Header (44 בייט) ***
-      if (
-        audioBuffer.length > 4 &&
-        audioBuffer.toString('ascii', 0, 4) === 'RIFF'
-      ) {
-        logInfo(
-          tag,
-          'Detected RIFF/WAV header from ElevenLabs – stripping first 44 bytes.'
-        );
-        audioBuffer = audioBuffer.subarray(44);
-      }
-
-      botSpeaking = true;
-
-      // בכל frame: 160 בייט (20ms ב־8kHz μ-law)
-      const chunkSize = 160;
-      const chunkDelayMs = 20;
-
-      for (
-        let i = 0;
-        i < audioBuffer.length &&
-        !callEnded &&
-        connection.readyState === WebSocket.OPEN;
-        i += chunkSize
-      ) {
-        const chunk = audioBuffer.subarray(i, i + chunkSize);
-        const b64 = chunk.toString('base64');
-        const twilioMsg = {
-          event: 'media',
-          streamSid,
-          media: { payload: b64 }
-        };
-        connection.send(JSON.stringify(twilioMsg));
-
-        // האטה קלה כדי לשמור על קצב נורמלי
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise((resolve) =>
-          setTimeout(resolve, chunkDelayMs)
-        );
-      }
-
-      botSpeaking = false;
-      noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
-    } catch (err) {
-      botSpeaking = false;
-      logError(tag, 'ElevenLabs TTS error', err);
-    }
-  }
+  const useOpenAiAudio = TTS_PROVIDER === 'openai';
+  const useEleven = TTS_PROVIDER === 'eleven';
 
   // -----------------------------
   // Helper: שליחת טקסט למודל עם הגנה על response כפול
   // -----------------------------
   function sendModelPrompt(text, purpose) {
     if (openAiWs.readyState !== WebSocket.OPEN) {
-      logDebug(
-        tag,
-        `Cannot send model prompt (${purpose || 'no-tag'}) – WS not open.`
-      );
+      logDebug(tag, `Cannot send model prompt (${purpose || 'no-tag'}) – WS not open.`);
       return;
     }
     if (hasActiveResponse) {
       logDebug(
         tag,
-        `Skipping model prompt (${purpose || 'no-tag'}) – active response in progress.`
+        `Skipping model prompt (${purpose || 'no-tag'}) – conversation already has active response.`
       );
       return;
     }
@@ -800,34 +661,27 @@ wss.on('connection', (connection, req) => {
     logInfo(tag, `Sending model prompt (${purpose || 'no-tag'})`);
   }
 
+  // -----------------------------
+  // Helper – האם הלקוח הזכיר מזוהה
+  // -----------------------------
   function conversationMentionsCallerId() {
-    const patterns = [
-      /מזוהה/,
-      /למספר שממנו/,
-      /למספר שממנו אני מתקשר/,
-      /למספר שממנו התקשרתי/
-    ];
+    const patterns = [/מזוהה/, /למספר שממנו/, /למספר שממנו אני מתקשר/, /למספר שממנו התקשרתי/];
     return conversationLog.some(
-      (m) =>
-        m.from === 'user' &&
-        patterns.some((re) => re.test(m.text || ''))
+      (m) => m.from === 'user' && patterns.some((re) => re.test(m.text || ''))
     );
   }
 
   // -----------------------------
-  // Lead webhook – פעם אחת בלבד
+  // Helper – שליחת וובהוק לידים – פעם אחת בלבד, ורק אם זה ליד מלא
   // -----------------------------
   async function sendLeadWebhook(reason, closingMessage) {
     if (!MB_ENABLE_LEAD_CAPTURE || !MB_WEBHOOK_URL) {
-      logDebug(
-        tag,
-        'Lead capture disabled or no MB_WEBHOOK_URL – skipping webhook.'
-      );
+      logDebug(tag, 'Lead capture disabled or no MB_WEBHOOK_URL – skipping webhook.');
       return;
     }
 
     if (leadWebhookSent) {
-      logDebug(tag, 'Lead webhook already sent – skipping.');
+      logDebug(tag, 'Lead webhook already sent for this call – skipping.');
       return;
     }
 
@@ -840,11 +694,9 @@ wss.on('connection', (connection, req) => {
       }
 
       let parsedLead = await extractLeadFromConversation(conversationLog);
+
       if (!parsedLead || typeof parsedLead !== 'object') {
-        logInfo(
-          tag,
-          'No parsed lead object – skipping webhook (לא ליד מלא).'
-        );
+        logInfo(tag, 'No parsed lead object – skipping webhook (לא ליד מלא).');
         return;
       }
 
@@ -856,9 +708,7 @@ wss.on('connection', (connection, req) => {
           : 'לא נמסר מספר טלפון מפורש בשיחה – נעשה שימוש במספר המזוהה מהמערכת.';
 
         parsedLead.notes =
-          (parsedLead.notes || '') +
-          (parsedLead.notes ? ' ' : '') +
-          suffixNote;
+          (parsedLead.notes || '') + (parsedLead.notes ? ' ' : '') + suffixNote;
       }
 
       const normalizedPhone = normalizePhoneNumber(
@@ -870,8 +720,7 @@ wss.on('connection', (connection, req) => {
       const callerDigits = normalizePhoneNumber(null, callerNumber);
 
       const callerIdRaw =
-        callerDigits ||
-        (callerNumber ? String(callerNumber).replace(/\D/g, '') : null);
+        callerDigits || (callerNumber ? String(callerNumber).replace(/\D/g, '') : null);
       const callerIdNormalized = callerDigits || callerIdRaw;
 
       parsedLead.caller_id_raw = callerIdRaw;
@@ -889,15 +738,11 @@ wss.on('connection', (connection, req) => {
         parsedLead.is_lead === true && !!parsedLead.phone_number;
 
       if (!isFullLead) {
-        logInfo(
-          tag,
-          'Parsed lead is NOT full lead – webhook will NOT be sent.',
-          {
-            is_lead: parsedLead.is_lead,
-            lead_type: parsedLead.lead_type,
-            phone_number: parsedLead.phone_number
-          }
-        );
+        logInfo(tag, 'Parsed lead is NOT full lead – webhook will NOT be sent.', {
+          is_lead: parsedLead.is_lead,
+          lead_type: parsedLead.lead_type,
+          phone_number: parsedLead.phone_number
+        });
         return;
       }
 
@@ -912,10 +757,8 @@ wss.on('connection', (connection, req) => {
         callerNumber: callerIdRaw,
         callerIdRaw,
         callerIdNormalized,
-
         phone_number: finalPhoneNumber,
         CALLERID: finalCallerId,
-
         botName: BOT_NAME,
         businessName: BUSINESS_NAME,
         startedAt: new Date(callStartTs).toISOString(),
@@ -943,16 +786,9 @@ wss.on('connection', (connection, req) => {
       });
 
       if (!res.ok) {
-        logError(
-          tag,
-          `Lead webhook HTTP ${res.status}`,
-          await res.text()
-        );
+        logError(tag, `Lead webhook HTTP ${res.status}`, await res.text());
       } else {
-        logInfo(
-          tag,
-          `Lead webhook delivered successfully. status=${res.status}`
-        );
+        logInfo(tag, `Lead webhook delivered successfully. status=${res.status}`);
       }
     } catch (err) {
       logError(tag, 'Error sending lead webhook', err);
@@ -960,7 +796,7 @@ wss.on('connection', (connection, req) => {
   }
 
   // -----------------------------
-  // Helper: סיום שיחה מרוכז
+  // Helper: סיום שיחה מרוכז – ניתוק אחרי סגיר
   // -----------------------------
   function endCall(reason, closingMessage) {
     if (callEnded) {
@@ -977,15 +813,8 @@ wss.on('connection', (connection, req) => {
     if (maxCallWarningTimeout) clearTimeout(maxCallWarningTimeout);
 
     if (MB_ENABLE_LEAD_CAPTURE && MB_WEBHOOK_URL) {
-      sendLeadWebhook(
-        reason,
-        closingMessage || MB_CLOSING_SCRIPT
-      ).catch((err) =>
-        logError(
-          tag,
-          'sendLeadWebhook fire-and-forget error',
-          err
-        )
+      sendLeadWebhook(reason, closingMessage || MB_CLOSING_SCRIPT).catch((err) =>
+        logError(tag, 'sendLeadWebhook fire-and-forget error', err)
       );
     }
 
@@ -1015,6 +844,9 @@ wss.on('connection', (connection, req) => {
     noListenUntilTs = 0;
   }
 
+  // -----------------------------
+  // Helper: תזמון סיום שיחה אחרי סגיר
+  // -----------------------------
   function scheduleEndCall(reason, closingMessage) {
     if (callEnded) return;
 
@@ -1025,10 +857,7 @@ wss.on('connection', (connection, req) => {
       return;
     }
 
-    logInfo(
-      tag,
-      `scheduleEndCall invoked. reason="${reason}", closingMessage="${msg}"`
-    );
+    logInfo(tag, `scheduleEndCall invoked. reason="${reason}", closingMessage="${msg}"`);
     pendingHangup = { reason, closingMessage: msg };
 
     if (openAiWs.readyState === WebSocket.OPEN) {
@@ -1045,20 +874,14 @@ wss.on('connection', (connection, req) => {
     }
 
     const rawGrace =
-      MB_HANGUP_GRACE_MS && MB_HANGUP_GRACE_MS > 0
-        ? MB_HANGUP_GRACE_MS
-        : 3000;
-
+      MB_HANGUP_GRACE_MS && MB_HANGUP_GRACE_MS > 0 ? MB_HANGUP_GRACE_MS : 3000;
     const graceMs = Math.max(2000, Math.min(rawGrace, 8000));
 
     setTimeout(() => {
       if (callEnded || !pendingHangup) return;
       const ph = pendingHangup;
       pendingHangup = null;
-      logInfo(
-        tag,
-        `Hangup grace reached (${graceMs} ms), forcing endCall.`
-      );
+      logInfo(tag, `Hangup grace reached (${graceMs} ms), forcing endCall.`);
       endCall(ph.reason, ph.closingMessage);
     }, graceMs);
 
@@ -1068,32 +891,27 @@ wss.on('connection', (connection, req) => {
     );
   }
 
+  // -----------------------------
+  // Helper: תזמון ניתוק כאשר הבוט כבר אמר את משפט הסיום (לפי MB_CLOSING_SCRIPT בלבד)
+  // -----------------------------
   function scheduleHangupAfterBotClosing(reason) {
     if (callEnded) return;
     if (pendingHangup) {
-      logDebug(
-        tag,
-        'Hangup already scheduled, skipping bot-closing duplicate.'
-      );
+      logDebug(tag, 'Hangup already scheduled, skipping bot-closing duplicate.');
       return;
     }
 
     const msg = MB_CLOSING_SCRIPT;
     pendingHangup = { reason, closingMessage: msg };
     const rawGrace =
-      MB_HANGUP_GRACE_MS && MB_HANGUP_GRACE_MS > 0
-        ? MB_HANGUP_GRACE_MS
-        : 3000;
+      MB_HANGUP_GRACE_MS && MB_HANGUP_GRACE_MS > 0 ? MB_HANGUP_GRACE_MS : 3000;
     const graceMs = Math.max(2000, Math.min(rawGrace, 8000));
 
     setTimeout(() => {
       if (callEnded || !pendingHangup) return;
       const ph = pendingHangup;
       pendingHangup = null;
-      logInfo(
-        tag,
-        `Hangup grace (bot closing) reached (${graceMs} ms), forcing endCall.`
-      );
+      logInfo(tag, `Hangup grace (bot closing) reached (${graceMs} ms), forcing endCall.`);
       endCall(ph.reason, ph.closingMessage);
     }, graceMs);
 
@@ -1103,6 +921,9 @@ wss.on('connection', (connection, req) => {
     );
   }
 
+  // -----------------------------
+  // Helper: בדיקת משפט סיום של הבוט – רק לפי MB_CLOSING_SCRIPT
+  // -----------------------------
   function checkBotClosing(botText) {
     if (!botText || !NORMALIZED_CLOSING_SCRIPT) return;
     const norm = normalizeForClosing(botText);
@@ -1112,14 +933,14 @@ wss.on('connection', (connection, req) => {
       norm.includes(NORMALIZED_CLOSING_SCRIPT) ||
       NORMALIZED_CLOSING_SCRIPT.includes(norm)
     ) {
-      logInfo(
-        tag,
-        `Detected configured bot closing phrase in output: "${botText}"`
-      );
+      logInfo(tag, `Detected configured bot closing phrase in output: "${botText}"`);
       scheduleHangupAfterBotClosing('bot_closing_config');
     }
   }
 
+  // -----------------------------
+  // Helper: הודעת "אתם עדיין איתי?"
+  // -----------------------------
   function sendIdleWarningIfNeeded() {
     if (idleWarningSent || callEnded) return;
     idleWarningSent = true;
@@ -1133,6 +954,93 @@ wss.on('connection', (connection, req) => {
   }
 
   // -----------------------------
+  // Helper: ElevenLabs TTS -> Twilio media (ulaw_8000)
+// -----------------------------
+  async function elevenSpeakToTwilio(text) {
+    const ttsTag = 'ElevenTTS';
+
+    if (!useEleven) return;
+    if (!ELEVEN_API_KEY) {
+      logError(ttsTag, 'ELEVEN_API_KEY missing – cannot use ElevenLabs TTS.');
+      return;
+    }
+    if (!ELEVEN_VOICE_ID) {
+      logError(ttsTag, 'ELEVEN_VOICE_ID / VOICE_ID missing – cannot use ElevenLabs TTS.');
+      return;
+    }
+    if (!streamSid) {
+      logDebug(ttsTag, 'No streamSid yet – cannot send audio to Twilio.');
+      return;
+    }
+    if (connection.readyState !== WebSocket.OPEN) {
+      logDebug(ttsTag, 'Twilio WS not open – cannot send audio.');
+      return;
+    }
+
+    try {
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}?output_format=${encodeURIComponent(
+        ELEVEN_OUTPUT_FORMAT
+      )}`;
+
+      const body = {
+        text,
+        model_id: ELEVEN_TTS_MODEL,
+        voice_settings: {
+          stability: 0.4,
+          similarity_boost: 0.9,
+          style: 0.3,
+          use_speaker_boost: true,
+          speed: MB_SPEECH_SPEED
+        }
+      };
+
+      logInfo(ttsTag, 'Sending text to ElevenLabs TTS.', { length: text.length });
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'xi-api-key': ELEVEN_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+      });
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        logError(ttsTag, `ElevenLabs TTS HTTP ${res.status}`, txt);
+        return;
+      }
+
+      const arrayBuf = await res.arrayBuffer();
+      const audioBuf = Buffer.from(arrayBuf);
+      logInfo(ttsTag, `ElevenLabs TTS audio received. length=${audioBuf.length} bytes`);
+
+      // ulaw_8000 = 8000 דגימות בשנייה, 1 בייט לדגימה
+      // Twilio משתמש בדרך-כלל ב-20ms = 160 בייט
+      const CHUNK_SIZE = 160;
+
+      for (let offset = 0; offset < audioBuf.length; offset += CHUNK_SIZE) {
+        const chunk = audioBuf.subarray(offset, offset + CHUNK_SIZE);
+        const payloadB64 = chunk.toString('base64');
+
+        if (connection.readyState !== WebSocket.OPEN) {
+          logDebug(ttsTag, 'Twilio WS closed while streaming Eleven audio.');
+          break;
+        }
+
+        const twilioMsg = {
+          event: 'media',
+          streamSid,
+          media: { payload: payloadB64 }
+        };
+        connection.send(JSON.stringify(twilioMsg));
+      }
+    } catch (err) {
+      logError(ttsTag, 'Error calling ElevenLabs TTS', err);
+    }
+  }
+
+  // -----------------------------
   // OpenAI WS handlers
   // -----------------------------
   openAiWs.on('open', () => {
@@ -1143,7 +1051,7 @@ wss.on('connection', (connection, req) => {
 
     const session = {
       model: 'gpt-4o-realtime-preview-2024-12-17',
-      modalities: ['audio', 'text'],
+      modalities: useOpenAiAudio ? ['audio', 'text'] : ['text'],
       input_audio_format: 'g711_ulaw',
       input_audio_transcription: { model: 'whisper-1' },
       turn_detection: {
@@ -1156,7 +1064,7 @@ wss.on('connection', (connection, req) => {
       instructions
     };
 
-    if (TTS_PROVIDER !== 'eleven') {
+    if (useOpenAiAudio) {
       session.voice = OPENAI_VOICE;
       session.output_audio_format = 'g711_ulaw';
     }
@@ -1204,22 +1112,21 @@ wss.on('connection', (connection, req) => {
 
       case 'response.audio_transcript.delta': {
         const delta = msg.delta || '';
-        if (delta) currentBotText += delta;
+        if (useOpenAiAudio && delta) currentBotText += delta;
         break;
       }
 
-      case 'response.output_text.done':
-      case 'response.audio_transcript.done': {
+      case 'response.output_text.done': {
         if (!currentBotText) break;
         const text = currentBotText.trim();
         if (text) {
           conversationLog.push({ from: 'bot', text });
           logInfo('Bot', text);
           checkBotClosing(text);
-
-          if (TTS_PROVIDER === 'eleven') {
-            playTtsWithEleven(text).catch((err) =>
-              logError(tag, 'playTtsWithEleven error', err)
+          if (useEleven) {
+            // כאן אנחנו נותנים ל-Elevenlabs לדבר
+            elevenSpeakToTwilio(text).catch((err) =>
+              logError('ElevenTTS', 'Error in elevenSpeakToTwilio', err)
             );
           }
         }
@@ -1227,11 +1134,23 @@ wss.on('connection', (connection, req) => {
         break;
       }
 
-      case 'response.audio.delta': {
-        if (TTS_PROVIDER === 'eleven') {
-          break;
+      case 'response.audio_transcript.done': {
+        // במקרה של OpenAI audio – זה רק תמלול
+        if (!useOpenAiAudio) break;
+        if (!currentBotText) break;
+        const text = currentBotText.trim();
+        if (text) {
+          conversationLog.push({ from: 'bot', text });
+          logInfo('Bot', text);
+          checkBotClosing(text);
         }
+        currentBotText = '';
+        break;
+      }
 
+      // אודיו מהמודל → לטוויליו (רק כשאנחנו על OPENAI TTS)
+      case 'response.audio.delta': {
+        if (!useOpenAiAudio) break;
         const b64 = msg.delta;
         if (!b64 || !streamSid) break;
         botSpeaking = true;
@@ -1251,17 +1170,12 @@ wss.on('connection', (connection, req) => {
       }
 
       case 'response.audio.done': {
-        if (TTS_PROVIDER !== 'eleven') {
-          botSpeaking = false;
-        }
+        botSpeaking = false;
         botTurnActive = false;
         if (pendingHangup && !callEnded) {
           const ph = pendingHangup;
           pendingHangup = null;
-          logInfo(
-            tag,
-            'Closing audio finished, ending call now (audio.done).'
-          );
+          logInfo(tag, 'Closing audio finished, ending call now.');
           endCall(ph.reason, ph.closingMessage);
         }
         break;
@@ -1274,10 +1188,7 @@ wss.on('connection', (connection, req) => {
         if (pendingHangup && !callEnded) {
           const ph = pendingHangup;
           pendingHangup = null;
-          logInfo(
-            tag,
-            'Response completed for closing, ending call now.'
-          );
+          logInfo(tag, 'Response completed for closing, ending call now.');
           endCall(ph.reason, ph.closingMessage);
         }
         break;
@@ -1287,9 +1198,7 @@ wss.on('connection', (connection, req) => {
         const transcriptRaw = msg.transcript || '';
         let t = transcriptRaw.trim();
         if (t) {
-          t = t
-            .replace(/\s+/g, ' ')
-            .replace(/\s+([,.:;!?])/g, '$1');
+          t = t.replace(/\s+/g, ' ').replace(/\s+([,.:;!?])/g, '$1');
           conversationLog.push({ from: 'user', text: t });
           logInfo('User', t);
           userHasSpoken = true;
@@ -1360,23 +1269,12 @@ wss.on('connection', (connection, req) => {
         const now = Date.now();
         const sinceMedia = now - lastMediaTs;
 
-        if (
-          !idleWarningSent &&
-          sinceMedia >= MB_IDLE_WARNING_MS &&
-          !callEnded
-        ) {
+        if (!idleWarningSent && sinceMedia >= MB_IDLE_WARNING_MS && !callEnded) {
           sendIdleWarningIfNeeded();
         }
-        if (
-          !idleHangupScheduled &&
-          sinceMedia >= MB_IDLE_HANGUP_MS &&
-          !callEnded
-        ) {
+        if (!idleHangupScheduled && sinceMedia >= MB_IDLE_HANGUP_MS && !callEnded) {
           idleHangupScheduled = true;
-          logInfo(
-            tag,
-            'Idle timeout reached, scheduling endCall.'
-          );
+          logInfo(tag, 'Idle timeout reached, scheduling endCall.');
           scheduleEndCall('idle_timeout', MB_CLOSING_SCRIPT);
         }
       }, 1000);
@@ -1397,10 +1295,7 @@ wss.on('connection', (connection, req) => {
         }
 
         maxCallTimeout = setTimeout(() => {
-          logInfo(
-            tag,
-            'Max call duration reached, scheduling endCall.'
-          );
+          logInfo(tag, 'Max call duration reached, scheduling endCall.');
           scheduleEndCall('max_call_duration', MB_CLOSING_SCRIPT);
         }, MB_MAX_CALL_MS);
       }
