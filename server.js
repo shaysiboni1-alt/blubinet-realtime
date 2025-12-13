@@ -5,11 +5,12 @@
 // TTS via ElevenLabs (streamed to Twilio as ulaw_8000 20ms frames)
 //
 // Fixes included:
-// 1) Cached opening audio at startup (best latency)
-// 2) Eleven TTS streamed (send audio as it arrives; no waiting for full buffer)
-// 3) Less noise sensitivity: MB_ALLOW_BARGE_IN=false by default + stronger VAD
-// 4) No double answers: ONLY use response.output_text.* for bot text (ignore audio_transcript.*)
-// 5) Eleven v3 compatibility: DO NOT send optimize_streaming_latency when model=eleven_v3
+// - Eleven v3: DO NOT send optimize_streaming_latency (prevents 400)
+// - Cached opening audio warmup + fast start
+// - Stream Eleven audio to Twilio in 20ms frames
+// - Noise stability: MB_ALLOW_BARGE_IN=false default + stronger VAD
+// - Prevent double bot replies: ONLY use response.output_text.*
+// - FIX: stop idle interval / timeouts on endCall (no logs after call ends)
 //
 
 require('dotenv').config();
@@ -71,7 +72,7 @@ const MB_LANGUAGES = envStr('MB_LANGUAGES', 'he,en,ru,ar')
   .map((s) => s.trim())
   .filter(Boolean);
 
-// --- VAD defaults (more stable vs noise)
+// VAD
 const MB_VAD_THRESHOLD = envNumber('MB_VAD_THRESHOLD', 0.75);
 const MB_VAD_SILENCE_MS = envNumber('MB_VAD_SILENCE_MS', 700);
 const MB_VAD_PREFIX_MS = envNumber('MB_VAD_PREFIX_MS', 150);
@@ -80,7 +81,7 @@ const MB_VAD_PREFIX_MS = envNumber('MB_VAD_PREFIX_MS', 150);
 const MB_IDLE_HANGUP_MS = envNumber('MB_IDLE_HANGUP_MS', 120000);
 const MB_MAX_CALL_MS = envNumber('MB_MAX_CALL_MS', 10 * 60 * 1000);
 
-// Barge-in: default FALSE for noise stability
+// Barge-in
 const MB_ALLOW_BARGE_IN = envBool('MB_ALLOW_BARGE_IN', false);
 const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 900);
 
@@ -103,9 +104,8 @@ const ELEVEN_LANGUAGE = envStr('ELEVENLABS_LANGUAGE', envStr('ELEVEN_LANGUAGE', 
 const ELEVEN_OUTPUT_FORMAT = envStr('ELEVEN_OUTPUT_FORMAT', 'ulaw_8000');
 
 // IMPORTANT: Eleven v3 does NOT support optimize_streaming_latency.
-// We'll only include it if model != eleven_v3
 const ELEVEN_OPTIMIZE_STREAMING_LATENCY = envNumber('ELEVEN_OPTIMIZE_STREAMING_LATENCY', 3);
-const ELEVEN_ENABLE_OPT_LATENCY = envBool('ELEVEN_ENABLE_OPT_LATENCY', true); // allow turning off entirely
+const ELEVEN_ENABLE_OPT_LATENCY = envBool('ELEVEN_ENABLE_OPT_LATENCY', true);
 
 // voice settings
 const ELEVEN_STABILITY = envNumber('ELEVEN_STABILITY', 0.5);
@@ -113,7 +113,7 @@ const ELEVEN_SIMILARITY = envNumber('ELEVEN_SIMILARITY', 0.75);
 const ELEVEN_STYLE = envNumber('ELEVEN_STYLE', 0.0);
 const ELEVEN_SPEAKER_BOOST = envBool('ELEVEN_SPEAKER_BOOST', true);
 
-// Cached opening (pre-generated at startup)
+// Cached opening
 const MB_CACHE_OPENING_AUDIO = envBool('MB_CACHE_OPENING_AUDIO', true);
 
 // -----------------------------
@@ -258,7 +258,6 @@ function buildElevenUrl() {
     language: ELEVEN_LANGUAGE,
   });
 
-  // v3 restriction: no optimize_streaming_latency
   const isV3 = String(ELEVEN_MODEL).toLowerCase() === 'eleven_v3';
   const shouldAddOpt =
     ELEVEN_ENABLE_OPT_LATENCY &&
@@ -302,7 +301,8 @@ async function elevenTtsStreamToSender(text, reason, sender, meta) {
     model: ELEVEN_MODEL,
     language: ELEVEN_LANGUAGE,
     format: ELEVEN_OUTPUT_FORMAT,
-    reason
+    reason,
+    url_has_opt_latency: url.includes('optimize_streaming_latency')
   }, meta);
 
   try {
@@ -377,7 +377,6 @@ async function warmupOpeningCache() {
       lang: ELEVEN_LANGUAGE,
       fmt: ELEVEN_OUTPUT_FORMAT,
       len: (MB_OPENING_SCRIPT || '').length,
-      // helpful debug
       url_has_opt_latency: url.includes('optimize_streaming_latency')
     });
 
@@ -412,10 +411,8 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// health
 app.get('/', (req, res) => res.status(200).send('OK'));
 
-// Twilio voice webhook -> Stream
 app.post('/twilio-voice', (req, res) => {
   const host = (DOMAIN || req.headers.host || '').replace(/^https?:\/\//, '');
   const wsUrl = MB_TWILIO_STREAM_URL || `wss://${host}/twilio-media-stream`;
@@ -499,9 +496,23 @@ wss.on('connection', (connection) => {
 
   const conversationLog = [];
 
+  // FIX: keep refs to clear timers properly
+  let idleInterval = null;
+  let maxCallTimeout = null;
+
+  function cleanupTimers() {
+    if (idleInterval) clearInterval(idleInterval);
+    idleInterval = null;
+    if (maxCallTimeout) clearTimeout(maxCallTimeout);
+    maxCallTimeout = null;
+  }
+
   function endCall(reason) {
     if (callEnded) return;
     callEnded = true;
+
+    // FIX: stop timers so logs don't continue after call ends
+    cleanupTimers();
 
     logInfo('Call', `endCall reason="${reason}"`, undefined, meta);
     logInfo('Call', 'Final conversation log:', conversationLog, meta);
@@ -682,8 +693,6 @@ wss.on('connection', (connection) => {
   });
 
   // ---- Twilio Media Stream handlers
-  let idleInterval = null;
-
   connection.on('message', async (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
@@ -710,8 +719,14 @@ wss.on('connection', (connection) => {
         }
       }
 
+      // FIX: stop old interval if any + interval self-stops on callEnded
       if (idleInterval) clearInterval(idleInterval);
       idleInterval = setInterval(() => {
+        if (callEnded) {
+          clearInterval(idleInterval);
+          idleInterval = null;
+          return;
+        }
         const since = Date.now() - lastMediaTs;
         if (since > MB_IDLE_HANGUP_MS) {
           logInfo('Call', 'Idle hangup.', { sinceMs: since }, meta);
@@ -719,8 +734,10 @@ wss.on('connection', (connection) => {
         }
       }, 1000);
 
+      // FIX: keep maxCallTimeout ref so we can clear it
       if (MB_MAX_CALL_MS > 0) {
-        setTimeout(() => {
+        if (maxCallTimeout) clearTimeout(maxCallTimeout);
+        maxCallTimeout = setTimeout(() => {
           if (!callEnded) endCall('max_call_duration');
         }, MB_MAX_CALL_MS);
       }
