@@ -1,16 +1,17 @@
 // server.js
 //
 // BluBinet Realtime Voice Bot – "נטע"
-// Twilio Media Streams <-> OpenAI Realtime (Whisper transcription)
+// Twilio Media Streams <-> OpenAI Realtime (Whisper transcription + VAD events)
 // LLM: OpenAI Responses API (default) OR IVRIT (fallback via ENV)
 // TTS: ElevenLabs streamed to Twilio as ulaw_8000 20ms frames
 //
-// Goals:
-// - FAST start (cached opening)
-// - FAST perceived latency (immediate ACK + chunked reply)
-// - Robust logs (always)
-// - Stop/clear TTS if user starts speaking (anti-cut, anti-overlap)
-// - Optional IVRIT LLM integration (fallback by ENV)
+// Fixes in this version:
+// ✅ FIX: Twilio sends media continuously (even silence) -> DO NOT treat that as "user speaking"
+// ✅ Use OpenAI VAD events: input_audio_buffer.speech_started / speech_stopped
+// ✅ FIX: Do NOT skip reply playback incorrectly (no more "User started speaking during LLM -> skip")
+// ✅ Proper turn queue: if user speaks again while LLM running -> cancel old reply and answer newest
+// ✅ Remove aggressive "clear" that could cut opening/tts
+// ✅ Keep fast opening cache + chunked reply + ACK
 //
 // Requirements:
 //   npm i express ws dotenv
@@ -60,12 +61,13 @@ const OPENAI_LLM_MODEL = envStr('OPENAI_LLM_MODEL', 'gpt-4o-mini');
 const OPENAI_LLM_TIMEOUT_MS = envNumber('OPENAI_LLM_TIMEOUT_MS', 12000);
 
 // IVRIT LLM (fallback)
-const IVRIT_LLM_URL = envStr('IVRIT_LLM_URL', ''); // e.g. https://<your-endpoint>/chat
+const IVRIT_LLM_URL = envStr('IVRIT_LLM_URL', '');
 const IVRIT_LLM_TIMEOUT_MS = envNumber('IVRIT_LLM_TIMEOUT_MS', 12000);
-const IVRIT_LLM_METHOD = envStr('IVRIT_LLM_METHOD', 'POST').toUpperCase(); // POST recommended
-const IVRIT_LLM_HEADER_KEY = envStr('IVRIT_LLM_HEADER_KEY', ''); // optional
-const IVRIT_LLM_HEADER_VALUE = envStr('IVRIT_LLM_HEADER_VALUE', ''); // optional
+const IVRIT_LLM_METHOD = envStr('IVRIT_LLM_METHOD', 'POST').toUpperCase();
+const IVRIT_LLM_HEADER_KEY = envStr('IVRIT_LLM_HEADER_KEY', '');
+const IVRIT_LLM_HEADER_VALUE = envStr('IVRIT_LLM_HEADER_VALUE', '');
 
+// Basic bot identity
 const BOT_NAME = envStr('MB_BOT_NAME', 'נטע');
 const BUSINESS_NAME = envStr('MB_BUSINESS_NAME', 'BluBinet');
 
@@ -73,20 +75,11 @@ const MB_OPENING_SCRIPT = envStr(
   'MB_OPENING_SCRIPT',
   'צהריים טובים, הגעתם ל־BluBinet. שמי נטע, איך אפשר לעזור לכם היום?'
 );
-const MB_CLOSING_SCRIPT = envStr(
-  'MB_CLOSING_SCRIPT',
-  'תודה שדיברתם עם BluBinet. יום נעים!'
-);
 
 const MB_GENERAL_PROMPT = envStr('MB_GENERAL_PROMPT', '');
 const MB_BUSINESS_PROMPT = envStr('MB_BUSINESS_PROMPT', '');
 
-const MB_LANGUAGES = envStr('MB_LANGUAGES', 'he,en,ru,ar')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-// VAD (transcription)
+// VAD (OpenAI server_vad)
 const MB_VAD_THRESHOLD = envNumber('MB_VAD_THRESHOLD', 0.75);
 const MB_VAD_SILENCE_MS = envNumber('MB_VAD_SILENCE_MS', 700);
 const MB_VAD_PREFIX_MS = envNumber('MB_VAD_PREFIX_MS', 150);
@@ -112,16 +105,15 @@ const MB_LOG_LEVEL = envStr('MB_LOG_LEVEL', 'info').toLowerCase(); // debug|info
 const TTS_PROVIDER = envStr('TTS_PROVIDER', 'eleven').toLowerCase();
 
 const ELEVEN_API_KEY = envStr('ELEVEN_API_KEY', envStr('ELEVENLABS_API_KEY', ''));
-const ELEVEN_VOICE_ID = envStr('ELEVEN_VOICE_ID', envStr('VOICE_ID', '')); // you have VOICE_ID
+const ELEVEN_VOICE_ID = envStr('ELEVEN_VOICE_ID', envStr('VOICE_ID', ''));
 const ELEVEN_MODEL = envStr('ELEVEN_TTS_MODEL', 'eleven_v3');
 const ELEVEN_LANGUAGE = envStr('ELEVENLABS_LANGUAGE', envStr('ELEVEN_LANGUAGE', 'he'));
 const ELEVEN_OUTPUT_FORMAT = envStr('ELEVEN_OUTPUT_FORMAT', 'ulaw_8000');
 
-// IMPORTANT: Eleven v3 does NOT support optimize_streaming_latency.
+// Eleven v3 does NOT support optimize_streaming_latency
 const ELEVEN_OPTIMIZE_STREAMING_LATENCY = envNumber('ELEVEN_OPTIMIZE_STREAMING_LATENCY', 3);
 const ELEVEN_ENABLE_OPT_LATENCY = envBool('ELEVEN_ENABLE_OPT_LATENCY', true);
 
-// voice settings
 const ELEVEN_STABILITY = envNumber('ELEVEN_STABILITY', 0.5);
 const ELEVEN_SIMILARITY = envNumber('ELEVEN_SIMILARITY', 0.75);
 const ELEVEN_STYLE = envNumber('ELEVEN_STYLE', 0.0);
@@ -130,34 +122,13 @@ const ELEVEN_SPEAKER_BOOST = envBool('ELEVEN_SPEAKER_BOOST', true);
 // Cached opening
 const MB_CACHE_OPENING_AUDIO = envBool('MB_CACHE_OPENING_AUDIO', true);
 
-// Chunking + ACK behavior (NEW)
+// Chunking + ACK
 const MB_CHUNK_MAX_CHARS = envNumber('MB_CHUNK_MAX_CHARS', 60);
 const MB_CHUNK_MIN_CHARS = envNumber('MB_CHUNK_MIN_CHARS', 18);
-const MB_CHUNK_GAP_MS = envNumber('MB_CHUNK_GAP_MS', 140); // tiny pause between chunks
+const MB_CHUNK_GAP_MS = envNumber('MB_CHUNK_GAP_MS', 140);
+
 const MB_ACK_ENABLED = envBool('MB_ACK_ENABLED', true);
 const MB_ACK_TEXT = envStr('MB_ACK_TEXT', 'מעולה, רגע...');
-const MB_ACK_MIN_LLM_MS = envNumber('MB_ACK_MIN_LLM_MS', 350); // if LLM is instant, no ack needed
-
-// -----------------------------
-// Guardrails
-// -----------------------------
-if (!OPENAI_API_KEY) console.error('❌ Missing OPENAI_API_KEY in ENV.');
-if (TTS_PROVIDER === 'eleven') {
-  if (!ELEVEN_API_KEY) console.error('❌ Missing ELEVEN_API_KEY (or ELEVENLABS_API_KEY) in ENV.');
-  if (!ELEVEN_VOICE_ID) console.error('❌ Missing VOICE_ID (or ELEVEN_VOICE_ID) in ENV.');
-}
-
-console.log(`[CONFIG] PORT=${PORT}`);
-console.log(`[CONFIG] OPENAI_REALTIME_MODEL=${OPENAI_REALTIME_MODEL}`);
-console.log(`[CONFIG] OPENAI_LLM_MODEL=${OPENAI_LLM_MODEL}, IVRIT_LLM_URL=${IVRIT_LLM_URL ? 'SET' : 'NOT_SET'}`);
-console.log(`[CONFIG] MB_ALLOW_BARGE_IN=${MB_ALLOW_BARGE_IN}, MB_NO_BARGE_TAIL_MS=${MB_NO_BARGE_TAIL_MS}`);
-console.log(`[CONFIG] VAD threshold=${MB_VAD_THRESHOLD} silence_ms=${MB_VAD_SILENCE_MS} prefix_ms=${MB_VAD_PREFIX_MS}`);
-console.log(`[CONFIG] TTS_PROVIDER=${TTS_PROVIDER}`);
-console.log(
-  `[CONFIG] ELEVEN voice_id=${ELEVEN_VOICE_ID ? 'SET' : 'NOT_SET'} model=${ELEVEN_MODEL} lang=${ELEVEN_LANGUAGE} fmt=${ELEVEN_OUTPUT_FORMAT} optLatency=${ELEVEN_OPTIMIZE_STREAMING_LATENCY}`
-);
-console.log(`[CONFIG] MB_CACHE_OPENING_AUDIO=${MB_CACHE_OPENING_AUDIO}`);
-console.log(`[CONFIG] CHUNK max=${MB_CHUNK_MAX_CHARS} min=${MB_CHUNK_MIN_CHARS} gapMs=${MB_CHUNK_GAP_MS} ACK=${MB_ACK_ENABLED ? 'ON' : 'OFF'}`);
 
 // -----------------------------
 // Logging helpers
@@ -189,10 +160,9 @@ const logError = (tag, msg, extra, meta) => log('error', tag, msg, extra, meta);
 const EXTRA_BEHAVIOR_RULES = `
 חוקי מערכת קבועים:
 1) דברו בעברית כברירת מחדל, לשון רבים, טון חם וקצר.
-2) אל תתייחסי לרעש/איכות קו. אם לא הבנת: "לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?"
+2) אם לא הבנת: "לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?"
 3) תשובות קצרות 1–3 משפטים, וסיימו בשאלה שמקדמת הבנה/איסוף צורך.
 4) אל תסיימו שיחה מיוזמתכם.
-5) אל תחזרו על אותה תשובה פעמיים.
 `.trim();
 
 function buildSystemInstructions() {
@@ -221,7 +191,6 @@ function createAudioSender(connection, meta) {
     streamSid: null,
     timer: null,
     queue: [],
-    clearedAt: 0,
   };
 
   function bindStreamSid(streamSid) {
@@ -235,17 +204,19 @@ function createAudioSender(connection, meta) {
     state.queue.push(buf);
   }
 
-  function clear() {
+  function clearQueueOnly() {
     state.queue = [];
-    state.clearedAt = Date.now();
-    if (state.streamSid && connection.readyState === WebSocket.OPEN) {
-      try {
-        // Twilio supports "clear" to flush audio already queued for playback
-        connection.send(JSON.stringify({ event: 'clear', streamSid: state.streamSid }));
-        logInfo('AudioSender', 'Sent Twilio clear event', undefined, meta);
-      } catch (e) {
-        logWarn('AudioSender', 'Failed sending clear', e, meta);
-      }
+  }
+
+  function clearTwilioPlayback() {
+    // Clear Twilio playback buffer (when barge-in enabled)
+    if (!state.streamSid) return;
+    if (connection.readyState !== WebSocket.OPEN) return;
+    try {
+      connection.send(JSON.stringify({ event: 'clear', streamSid: state.streamSid }));
+      logInfo('AudioSender', 'Sent Twilio clear event', undefined, meta);
+    } catch (e) {
+      logWarn('AudioSender', 'Failed sending clear', e, meta);
     }
   }
 
@@ -256,7 +227,7 @@ function createAudioSender(connection, meta) {
       if (connection.readyState !== WebSocket.OPEN) return;
       if (state.queue.length === 0) return;
 
-      const frameSize = 160; // 20ms @ 8k ulaw
+      const frameSize = 160;
       let cur = state.queue[0];
 
       if (cur.length <= frameSize) {
@@ -286,14 +257,13 @@ function createAudioSender(connection, meta) {
     }
   }
 
-  return { bindStreamSid, enqueue, clear, stop };
+  return { bindStreamSid, enqueue, clearQueueOnly, clearTwilioPlayback, stop };
 }
 
 // -----------------------------
-// ElevenLabs URL builder (handles v3 restriction)
+// ElevenLabs URL builder (v3 restriction)
 // -----------------------------
 function buildElevenUrl() {
-  // Use /stream endpoint explicitly (better first-byte behavior)
   const baseUrl = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_VOICE_ID)}/stream`;
   const qs = new URLSearchParams({
     output_format: ELEVEN_OUTPUT_FORMAT,
@@ -307,18 +277,14 @@ function buildElevenUrl() {
     Number.isFinite(ELEVEN_OPTIMIZE_STREAMING_LATENCY) &&
     ELEVEN_OPTIMIZE_STREAMING_LATENCY > 0;
 
-  if (shouldAddOpt) {
-    qs.set('optimize_streaming_latency', String(ELEVEN_OPTIMIZE_STREAMING_LATENCY));
-  }
-
+  if (shouldAddOpt) qs.set('optimize_streaming_latency', String(ELEVEN_OPTIMIZE_STREAMING_LATENCY));
   return `${baseUrl}?${qs.toString()}`;
 }
 
 // -----------------------------
-// ElevenLabs streaming TTS -> push to AudioSender as chunks arrive
-// Returns timing metrics for logs
+// ElevenLabs streaming TTS
 // -----------------------------
-async function elevenTtsStreamToSender(text, reason, sender, meta, abortSignalFn) {
+async function elevenTtsStreamToSender(text, reason, sender, meta, abortFn) {
   if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
     logError('ElevenTTS', 'Missing ELEVEN_API_KEY or VOICE_ID', undefined, meta);
     return { ok: false };
@@ -338,19 +304,7 @@ async function elevenTtsStreamToSender(text, reason, sender, meta, abortSignalFn
     },
   };
 
-  logInfo(
-    'ElevenTTS',
-    'TTS request',
-    {
-      reason,
-      length: cleaned.length,
-      model: ELEVEN_MODEL,
-      lang: ELEVEN_LANGUAGE,
-      fmt: ELEVEN_OUTPUT_FORMAT,
-      url,
-    },
-    meta
-  );
+  logInfo('ElevenTTS', 'TTS request', { reason, length: cleaned.length, model: ELEVEN_MODEL, lang: ELEVEN_LANGUAGE, fmt: ELEVEN_OUTPUT_FORMAT }, meta);
 
   const t0 = Date.now();
   let firstByteMs = null;
@@ -386,17 +340,13 @@ async function elevenTtsStreamToSender(text, reason, sender, meta, abortSignalFn
     const reader = res.body.getReader();
 
     while (true) {
-      if (abortSignalFn && abortSignalFn()) {
-        logWarn('ElevenTTS', 'Aborting TTS stream (user started speaking)', undefined, meta);
-        try {
-          reader.cancel().catch(() => {});
-        } catch {}
+      if (abortFn && abortFn()) {
+        try { reader.cancel().catch(() => {}); } catch {}
+        logWarn('ElevenTTS', 'TTS aborted', undefined, meta);
         return { ok: false, aborted: true };
       }
-
       const { value, done } = await reader.read();
       if (done) break;
-
       if (value && value.length) {
         if (firstByteMs === null) firstByteMs = Date.now() - t0;
         const buf = Buffer.from(value);
@@ -415,9 +365,9 @@ async function elevenTtsStreamToSender(text, reason, sender, meta, abortSignalFn
 }
 
 // -----------------------------
-// Cached opening audio (generated once at startup)
+// Cached opening audio
 // -----------------------------
-let OPENING_AUDIO_CACHE = null; // Buffer in ulaw_8000
+let OPENING_AUDIO_CACHE = null;
 async function warmupOpeningCache() {
   if (!MB_CACHE_OPENING_AUDIO) return;
   if (TTS_PROVIDER !== 'eleven') return;
@@ -428,21 +378,11 @@ async function warmupOpeningCache() {
     const text = String(MB_OPENING_SCRIPT || '').trim();
     if (!text) return;
 
-    logInfo('Startup', 'Warming opening audio cache with ElevenLabs...', {
-      model: ELEVEN_MODEL,
-      lang: ELEVEN_LANGUAGE,
-      fmt: ELEVEN_OUTPUT_FORMAT,
-      len: text.length,
-      url_has_opt_latency: url.includes('optimize_streaming_latency'),
-    });
+    logInfo('Startup', 'Warming opening audio cache with ElevenLabs...', { model: ELEVEN_MODEL, lang: ELEVEN_LANGUAGE, fmt: ELEVEN_OUTPUT_FORMAT, len: text.length, url_has_opt_latency: url.includes('optimize_streaming_latency') });
 
     const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'xi-api-key': ELEVEN_API_KEY,
-        'Content-Type': 'application/json',
-        Accept: 'audio/*',
-      },
+      headers: { 'xi-api-key': ELEVEN_API_KEY, 'Content-Type': 'application/json', Accept: 'audio/*' },
       body: JSON.stringify({
         text,
         model_id: ELEVEN_MODEL,
@@ -472,6 +412,26 @@ async function warmupOpeningCache() {
 // -----------------------------
 // LLM: OpenAI Responses API
 // -----------------------------
+function extractOpenAiText(respJson) {
+  try {
+    const output = respJson && respJson.output;
+    if (Array.isArray(output)) {
+      let acc = '';
+      for (const item of output) {
+        const content = item && item.content;
+        if (Array.isArray(content)) {
+          for (const c of content) {
+            if (c && (c.type === 'output_text' || c.type === 'text') && typeof c.text === 'string') acc += c.text;
+          }
+        }
+      }
+      return acc.trim();
+    }
+  } catch {}
+  try { if (respJson && typeof respJson.output_text === 'string') return respJson.output_text.trim(); } catch {}
+  return '';
+}
+
 async function callOpenAiResponses({ system, userText, meta }) {
   const url = 'https://api.openai.com/v1/responses';
   const body = {
@@ -491,10 +451,7 @@ async function callOpenAiResponses({ system, userText, meta }) {
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
@@ -503,13 +460,12 @@ async function callOpenAiResponses({ system, userText, meta }) {
 
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
-      logWarn('LLM', `OpenAI Responses HTTP ${res.status}`, { ms, body: txt }, meta);
+      logWarn('LLM', `OpenAI HTTP ${res.status}`, { ms, body: txt }, meta);
       return { ok: false, ms, text: null };
     }
 
     const json = await res.json();
     const text = extractOpenAiText(json);
-
     logInfo('LLM', 'OpenAI ok', { ms, len: text ? text.length : 0 }, meta);
     return { ok: true, ms, text: text || '' };
   } catch (e) {
@@ -521,33 +477,8 @@ async function callOpenAiResponses({ system, userText, meta }) {
   }
 }
 
-function extractOpenAiText(respJson) {
-  // Responses API can return output array with content items
-  try {
-    const output = respJson && respJson.output;
-    if (Array.isArray(output)) {
-      let acc = '';
-      for (const item of output) {
-        const content = item && item.content;
-        if (Array.isArray(content)) {
-          for (const c of content) {
-            if (c && (c.type === 'output_text' || c.type === 'text') && typeof c.text === 'string') acc += c.text;
-          }
-        }
-      }
-      return acc.trim();
-    }
-  } catch {}
-  // Fallback
-  try {
-    if (respJson && typeof respJson.output_text === 'string') return respJson.output_text.trim();
-  } catch {}
-  return '';
-}
-
 // -----------------------------
 // LLM: IVRIT (fallback by ENV)
-// Expected response: { "text": "..." }  (you can adapt later)
 // -----------------------------
 async function callIvrit({ system, userText, meta }) {
   const t0 = Date.now();
@@ -558,9 +489,7 @@ async function callIvrit({ system, userText, meta }) {
 
   try {
     const headers = { 'Content-Type': 'application/json' };
-    if (IVRIT_LLM_HEADER_KEY && IVRIT_LLM_HEADER_VALUE) {
-      headers[IVRIT_LLM_HEADER_KEY] = IVRIT_LLM_HEADER_VALUE;
-    }
+    if (IVRIT_LLM_HEADER_KEY && IVRIT_LLM_HEADER_VALUE) headers[IVRIT_LLM_HEADER_KEY] = IVRIT_LLM_HEADER_VALUE;
 
     const res = await fetch(IVRIT_LLM_URL, {
       method: IVRIT_LLM_METHOD,
@@ -591,18 +520,15 @@ async function callIvrit({ system, userText, meta }) {
 }
 
 // -----------------------------
-// Reply chunking (NEW)
+// Reply chunking
 // -----------------------------
 function splitToChunks(text, maxChars, minChars) {
   const t = String(text || '').trim();
   if (!t) return [];
 
-  // Normalize whitespace
   const norm = t.replace(/\s+/g, ' ').trim();
-
-  // Split by sentence-ish punctuation first
   const parts = norm
-    .split(/(?<=[\.\!\?\u05F3\u05F4\u061F])\s+/) // .,!,?, Hebrew/Geresh, Arabic question mark
+    .split(/(?<=[\.\!\?\u05F3\u05F4\u061F])\s+/)
     .map((p) => p.trim())
     .filter(Boolean);
 
@@ -615,42 +541,28 @@ function splitToChunks(text, maxChars, minChars) {
     cur = '';
   }
 
-  for (const p of parts.length ? parts : [norm]) {
-    // If part itself too large, hard-wrap by words
+  for (const p of (parts.length ? parts : [norm])) {
     if (p.length > maxChars) {
       const words = p.split(' ');
       for (const w of words) {
-        if (!cur) {
-          cur = w;
-        } else if ((cur + ' ' + w).length <= maxChars) {
-          cur += ' ' + w;
-        } else {
-          pushCur();
-          cur = w;
-        }
+        if (!cur) cur = w;
+        else if ((cur + ' ' + w).length <= maxChars) cur += ' ' + w;
+        else { pushCur(); cur = w; }
       }
       pushCur();
       continue;
     }
 
-    // Accumulate parts until max
-    if (!cur) {
-      cur = p;
-    } else if ((cur + ' ' + p).length <= maxChars) {
-      cur += ' ' + p;
-    } else {
-      pushCur();
-      cur = p;
-    }
+    if (!cur) cur = p;
+    else if ((cur + ' ' + p).length <= maxChars) cur += ' ' + p;
+    else { pushCur(); cur = p; }
   }
   pushCur();
 
-  // If first chunk is too tiny, merge it with next
   if (chunks.length >= 2 && chunks[0].length < minChars) {
     chunks[1] = `${chunks[0]} ${chunks[1]}`.trim();
     chunks.shift();
   }
-
   return chunks;
 }
 
@@ -690,15 +602,15 @@ const wss = new WebSocket.Server({ server, path: '/twilio-media-stream' });
 async function hangupTwilioCall(callSid, meta) {
   if (!callSid) return;
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
+
   try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${TWILIO_ACCOUNT_SID ? callSid : callSid}.json`;
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
     const body = new URLSearchParams({ Status: 'completed' });
 
     const res = await fetch(url, {
       method: 'POST',
       headers: {
-        Authorization:
-          'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'),
+        Authorization: 'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'),
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body,
@@ -734,21 +646,23 @@ wss.on('connection', (connection) => {
   let callEnded = false;
 
   let lastMediaTs = Date.now();
-
-  // Speaking / barge-in control
-  let botSpeaking = false;
-  let noListenUntilTs = 0;
-  let userSpeakingRecently = false;
-  let lastUserAudioAt = 0;
-
-  // Used to cancel/stop outgoing speech when user starts speaking
-  let speechGen = 0; // increments each time we start a new reply
-  let lastUserTextAt = 0;
-
-  const conversationLog = [];
-
   let idleInterval = null;
   let maxCallTimeout = null;
+
+  // VAD state (real speech events from OpenAI)
+  let userIsSpeaking = false;
+
+  // Speech generation control (cancel old speech when new turn arrives)
+  let speechGen = 0;
+  let botSpeaking = false;
+  let noListenUntilTs = 0;
+
+  // LLM turn queue
+  let turnCounter = 0;
+  let llmBusy = false;
+  let pendingTurn = null; // { turnId, text }
+
+  const conversationLog = [];
 
   function cleanupTimers() {
     if (idleInterval) clearInterval(idleInterval);
@@ -773,8 +687,9 @@ wss.on('connection', (connection) => {
 
   function shouldAbortSpeech(myGen) {
     if (callEnded) return true;
-    if (myGen !== speechGen) return true; // new speech started, cancel old
-    if (userSpeakingRecently) return true;
+    if (myGen !== speechGen) return true;
+    // If barge-in enabled, abort speech when user actually speaks (VAD)
+    if (MB_ALLOW_BARGE_IN && userIsSpeaking) return true;
     return false;
   }
 
@@ -784,105 +699,118 @@ wss.on('connection', (connection) => {
     if (shouldAbortSpeech(myGen)) return;
 
     botSpeaking = true;
-    sender.clear(); // ensure no old frames are stuck
-    await elevenTtsStreamToSender(
-      t,
-      reason,
-      sender,
-      meta,
-      () => shouldAbortSpeech(myGen)
-    );
+    const r = await elevenTtsStreamToSender(t, reason, sender, meta, () => shouldAbortSpeech(myGen));
     botSpeaking = false;
+
+    // tail: if barge-in disabled, ignore input for short time after bot speech
     noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
+    return r;
   }
 
-  async function speakChunked(text, baseReason) {
+  async function speakChunked(text, baseReason, myGen) {
     const reply = String(text || '').trim();
     if (!reply) return;
 
-    const myGen = ++speechGen;
     const chunks = splitToChunks(reply, MB_CHUNK_MAX_CHARS, MB_CHUNK_MIN_CHARS);
-
     logInfo('Chunking', 'Split reply', { chunks: chunks.length, maxChars: MB_CHUNK_MAX_CHARS }, meta);
 
     for (let i = 0; i < chunks.length; i++) {
       if (shouldAbortSpeech(myGen)) {
-        logWarn('Chunking', 'Stopped chunk playback (user started speaking / new gen)', { atChunk: i + 1 }, meta);
+        logWarn('Chunking', 'Stopped chunk playback', { atChunk: i + 1 }, meta);
         return;
       }
-      const reason = `${baseReason}:chunk_${i + 1}/${chunks.length}`;
-      await speakText(chunks[i], reason, myGen);
-
-      if (i < chunks.length - 1) {
-        // tiny pause to reduce "machine gun" feel
-        await new Promise((r) => setTimeout(r, MB_CHUNK_GAP_MS));
-      }
+      await speakText(chunks[i], `${baseReason}:chunk_${i + 1}/${chunks.length}`, myGen);
+      if (i < chunks.length - 1) await new Promise((r) => setTimeout(r, MB_CHUNK_GAP_MS));
     }
   }
 
-  async function processUserText(userText, trigger) {
+  async function runLlmForTurn(turnId, userText) {
     const t = String(userText || '').trim();
     if (!t) return;
 
-    lastUserTextAt = Date.now();
+    llmBusy = true;
+
+    // Start a new bot speech generation for this turn (cancels old ones)
+    const myGen = ++speechGen;
+
+    // Store user
     conversationLog.push({ from: 'user', text: t });
     logInfo('User', t, undefined, meta);
 
-    const system = buildSystemInstructions();
-
-    // Fast ACK if LLM likely slow
-    let didAck = false;
-    let ackStart = Date.now();
-
-    // Fire ACK immediately (perceived speed)
+    // Immediate ACK (does not cancel anything, just speaks now)
     if (MB_ACK_ENABLED && MB_ACK_TEXT) {
-      didAck = true;
-      logInfo('ACK', 'Speaking immediate ack', { text: MB_ACK_TEXT }, meta);
       conversationLog.push({ from: 'bot', text: MB_ACK_TEXT });
-      await speakText(MB_ACK_TEXT, 'ack', speechGen + 1); // doesn't increment gen, but still plays now
-      ackStart = Date.now();
+      logInfo('ACK', 'Speaking immediate ack', { text: MB_ACK_TEXT }, meta);
+      await speakText(MB_ACK_TEXT, 'ack', myGen);
     }
 
-    // Choose LLM: IVRIT if set, else OpenAI
-    logInfo('LLM', 'Processing user text', { trigger, textLen: t.length }, meta);
+    const system = buildSystemInstructions();
+
+    // Choose IVRIT if set, else OpenAI. If IVRIT fails -> fallback OpenAI.
+    logInfo('LLM', 'Processing user text', { trigger: 'transcript_completed', textLen: t.length, turnId }, meta);
 
     let llmRes;
     if (IVRIT_LLM_URL) {
       llmRes = await callIvrit({ system, userText: t, meta });
       if (!llmRes.ok) {
-        // fallback to OpenAI if IVRIT fails
-        logWarn('LLM', 'IVRIT failed -> fallback to OpenAI', undefined, meta);
+        logWarn('LLM', 'IVRIT failed -> fallback OpenAI', undefined, meta);
         llmRes = await callOpenAiResponses({ system, userText: t, meta });
       }
     } else {
       llmRes = await callOpenAiResponses({ system, userText: t, meta });
     }
 
-    // If LLM is super fast, ACK might be redundant, but we already spoke it.
-    // That’s okay—our chunking makes it feel natural.
+    // If a newer turn arrived while we were working, drop this reply and handle the newest
+    if (pendingTurn && pendingTurn.turnId > turnId) {
+      logWarn('LLM', 'Newer user turn exists -> skip old reply', { oldTurn: turnId, newTurn: pendingTurn.turnId }, meta);
+      llmBusy = false;
+      return;
+    }
 
     const reply = (llmRes && llmRes.ok && llmRes.text) ? String(llmRes.text).trim() : '';
     if (!reply) {
       const fallback = 'לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?';
       conversationLog.push({ from: 'bot', text: fallback });
       logInfo('Bot', fallback, undefined, meta);
-      await speakChunked(fallback, 'fallback_no_reply');
-      return;
-    }
-
-    // If we spoke ACK and user started talking during LLM, abort reply and wait.
-    if (userSpeakingRecently) {
-      logWarn('LLM', 'User started speaking during LLM -> skip reply playback', undefined, meta);
+      await speakChunked(fallback, 'fallback', myGen);
+      llmBusy = false;
       return;
     }
 
     conversationLog.push({ from: 'bot', text: reply });
     logInfo('Bot', reply, undefined, meta);
 
-    await speakChunked(reply, 'llm_reply');
+    await speakChunked(reply, 'llm_reply', myGen);
+
+    llmBusy = false;
   }
 
-  // ---- OpenAI WS (transcription only)
+  function enqueueTurn(text) {
+    turnCounter++;
+    const turnId = turnCounter;
+
+    // Always keep only the newest pending turn (reduces backlog delay)
+    if (llmBusy) {
+      pendingTurn = { turnId, text };
+      logInfo('LLM', 'Queued newer user turn (LLM busy)', { turnId, textLen: text.length }, meta);
+      return;
+    }
+
+    pendingTurn = null;
+    runLlmForTurn(turnId, text).then(() => {
+      // After finishing, if something new queued during run -> handle it now
+      if (!callEnded && pendingTurn && !llmBusy) {
+        const pt = pendingTurn;
+        pendingTurn = null;
+        runLlmForTurn(pt.turnId, pt.text).catch((e) => logWarn('LLM', 'runLlmForTurn error (pending)', e, meta));
+      }
+    }).catch((e) => {
+      llmBusy = false;
+      logWarn('LLM', 'runLlmForTurn error', e, meta);
+    });
+  }
+
+  // ---- OpenAI WS (VAD + transcription)
   const openAiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
     {
@@ -896,13 +824,11 @@ wss.on('connection', (connection) => {
   openAiWs.on('open', () => {
     logInfo('Call', 'Connected to OpenAI Realtime API.', undefined, meta);
 
-    const instructions = buildSystemInstructions();
-
     openAiWs.send(JSON.stringify({
       type: 'session.update',
       session: {
         model: OPENAI_REALTIME_MODEL,
-        modalities: ['text'], // transcription only
+        modalities: ['text'],
         input_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'whisper-1' },
         turn_detection: {
@@ -911,7 +837,7 @@ wss.on('connection', (connection) => {
           silence_duration_ms: MB_VAD_SILENCE_MS,
           prefix_padding_ms: MB_VAD_PREFIX_MS,
         },
-        instructions,
+        instructions: buildSystemInstructions(),
       },
     }));
   });
@@ -930,9 +856,30 @@ wss.on('connection', (connection) => {
   let lastTranscript = '';
   let lastTranscriptAt = 0;
 
-  openAiWs.on('message', async (data) => {
+  openAiWs.on('message', (data) => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
+
+    // VAD events (THIS is the correct "user speaking" signal)
+    if (msg.type === 'input_audio_buffer.speech_started') {
+      userIsSpeaking = true;
+      logDebug('VAD', 'speech_started', undefined, meta);
+
+      // If barge-in allowed and bot is speaking -> clear playback & cancel speech
+      if (MB_ALLOW_BARGE_IN && botSpeaking) {
+        speechGen++;
+        sender.clearQueueOnly();
+        sender.clearTwilioPlayback();
+        logInfo('Barge', 'User interrupted -> cleared playback', undefined, meta);
+      }
+      return;
+    }
+
+    if (msg.type === 'input_audio_buffer.speech_stopped') {
+      userIsSpeaking = false;
+      logDebug('VAD', 'speech_stopped', undefined, meta);
+      return;
+    }
 
     if (msg.type === 'conversation.item.input_audio_transcription.completed') {
       const t = String(msg.transcript || '').trim();
@@ -943,27 +890,13 @@ wss.on('connection', (connection) => {
       lastTranscript = t;
       lastTranscriptAt = now;
 
-      // user has spoken -> stop any current TTS and mark speaking recently
-      userSpeakingRecently = true;
-      lastUserAudioAt = Date.now();
-      speechGen++; // cancel any in-flight chunks
-      sender.clear();
-
-      // small window: after transcript comes, allow reply once user stops
-      setTimeout(() => {
-        // if no new audio in the last 350ms, consider user done
-        const since = Date.now() - lastUserAudioAt;
-        if (since > 350) userSpeakingRecently = false;
-      }, 420);
-
-      // Process text (LLM + chunked reply)
-      processUserText(t, 'transcript_completed').catch((e) => {
-        logWarn('LLM', 'processUserText error', e, meta);
-      });
+      enqueueTurn(t);
+      return;
     }
 
     if (msg.type === 'error') {
       logWarn('OpenAI', 'Realtime error', msg.error || msg, meta);
+      return;
     }
   });
 
@@ -981,13 +914,12 @@ wss.on('connection', (connection) => {
 
       logInfo('Call', `Twilio stream started. streamSid=${streamSid}, callSid=${callSid}`, undefined, meta);
 
-      // PLAY OPENING IMMEDIATELY:
+      // Opening now
       conversationLog.push({ from: 'bot', text: MB_OPENING_SCRIPT });
 
       if (TTS_PROVIDER === 'eleven') {
         if (OPENING_AUDIO_CACHE && OPENING_AUDIO_CACHE.length) {
-          const approxSeconds = Math.round((OPENING_AUDIO_CACHE.length / 8000) * 100) / 100; // rough
-          logInfo('Opening', 'Playing cached opening', { bytes: OPENING_AUDIO_CACHE.length, approxSeconds }, meta);
+          logInfo('Opening', 'Playing cached opening', { bytes: OPENING_AUDIO_CACHE.length }, meta);
           sender.enqueue(Buffer.from(OPENING_AUDIO_CACHE));
         } else {
           logInfo('Opening', 'No cache; streaming opening now', undefined, meta);
@@ -1023,34 +955,22 @@ wss.on('connection', (connection) => {
 
     if (msg.event === 'media') {
       lastMediaTs = Date.now();
-
       const payload = msg.media?.payload;
       if (!payload) return;
 
-      // Mark user audio activity (helps cancel speech fast)
-      lastUserAudioAt = Date.now();
-
-      // If bot is speaking and barge-in is disabled, we still WANT to detect speech and stop TTS.
-      // So we always treat incoming audio as "user speaking".
-      if (botSpeaking) {
-        userSpeakingRecently = true;
-        speechGen++; // cancel chunks
-        sender.clear();
-        logDebug('Barge', 'User audio while bot speaking -> clear & cancel', undefined, meta);
-
-        setTimeout(() => {
-          const since = Date.now() - lastUserAudioAt;
-          if (since > 350) userSpeakingRecently = false;
-        }, 420);
-      }
-
-      // If barge-in disabled, avoid feeding audio during bot talk tail
-      const now = Date.now();
-      if (!MB_ALLOW_BARGE_IN) {
-        if (botSpeaking || now < noListenUntilTs) return;
-      }
-
       if (openAiWs.readyState !== WebSocket.OPEN) return;
+
+      const now = Date.now();
+
+      // If barge-in disabled, ignore audio during bot speech tail
+      if (!MB_ALLOW_BARGE_IN) {
+        if (botSpeaking || now < noListenUntilTs) {
+          // Still feed audio to OpenAI? NO — we *do* feed so VAD can know user speaks,
+          // but we keep it disabled here to reduce false triggers from echo.
+          // If you want real-time barge-in detection while disabled, switch this to "do feed".
+          return;
+        }
+      }
 
       openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
       return;
