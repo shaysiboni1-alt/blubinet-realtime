@@ -1,16 +1,16 @@
 // server.js
 //
 // BluBinet Realtime Voice Bot – "נטע"
-// Twilio Media Streams <-> OpenAI Realtime API (LLM) + ElevenLabs (TTS)
+// Twilio Media Streams <-> OpenAI Realtime (LLM + Whisper transcription)
+// TTS via ElevenLabs (streamed to Twilio as ulaw_8000 20ms frames)
 //
-// מטרה:
-// - שיחה יציבה בלי "לא שמעתי טוב" סתם
-// - בלי שגיאת conversation_already_has_active_response
-// - פתיח מהיר (Eleven ישירות) במקום לחכות ל־OpenAI
-// - לוגים תמידיים וברורים עם rid לכל שיחה
-// - תשתית IVRIT לתמלול (STT) דרך endpoint שתגדיר
+// Fixes included:
+// 1) Cached opening audio at startup (no long delay to first sound)
+// 2) Eleven TTS streamed (send audio as it arrives; no waiting for full buffer)
+// 3) Less noise sensitivity: MB_ALLOW_BARGE_IN=false by default + stronger VAD
+// 4) No double answers: ONLY use response.output_text.* for bot text (ignore audio_transcript.*)
 //
-// Twilio Voice Webhook ->  POST /twilio-voice  (TwiML)
+// Twilio Voice Webhook -> POST /twilio-voice (TwiML)
 // Twilio Media Streams -> wss://<domain>/twilio-media-stream
 //
 
@@ -47,8 +47,8 @@ function rid() {
 // -----------------------------
 const PORT = envNumber('PORT', 3000);
 
-const DOMAIN = envStr('DOMAIN', ''); // מומלץ להגדיר: blubinet-realtime.onrender.com
-const MB_TWILIO_STREAM_URL = envStr('MB_TWILIO_STREAM_URL', ''); // אופציונלי: wss://.../twilio-media-stream
+const DOMAIN = envStr('DOMAIN', '');
+const MB_TWILIO_STREAM_URL = envStr('MB_TWILIO_STREAM_URL', '');
 
 const OPENAI_API_KEY = envStr('OPENAI_API_KEY', '');
 const OPENAI_REALTIME_MODEL = envStr('OPENAI_REALTIME_MODEL', 'gpt-4o-realtime-preview-2024-12-17');
@@ -60,7 +60,6 @@ const MB_OPENING_SCRIPT = envStr(
   'MB_OPENING_SCRIPT',
   'צהריים טובים, הגעתם ל־BluBinet. שמי נטע, איך אפשר לעזור לכם היום?'
 );
-
 const MB_CLOSING_SCRIPT = envStr(
   'MB_CLOSING_SCRIPT',
   'תודה שדיברתם עם BluBinet. נציג יחזור אליכם בהקדם. יום נעים!'
@@ -69,208 +68,146 @@ const MB_CLOSING_SCRIPT = envStr(
 const MB_GENERAL_PROMPT = envStr('MB_GENERAL_PROMPT', '');
 const MB_BUSINESS_PROMPT = envStr('MB_BUSINESS_PROMPT', '');
 
+// Languages just for policy/context (no hard logic here)
 const MB_LANGUAGES = envStr('MB_LANGUAGES', 'he,en,ru,ar')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
 
-// VAD defaults
-const MB_VAD_THRESHOLD = envNumber('MB_VAD_THRESHOLD', 0.65);
-const MB_VAD_SILENCE_MS = envNumber('MB_VAD_SILENCE_MS', 650);
-const MB_VAD_PREFIX_MS = envNumber('MB_VAD_PREFIX_MS', 180);
+// --- VAD defaults (more stable vs noise)
+const MB_VAD_THRESHOLD = envNumber('MB_VAD_THRESHOLD', 0.75);
+const MB_VAD_SILENCE_MS = envNumber('MB_VAD_SILENCE_MS', 800);
+const MB_VAD_PREFIX_MS = envNumber('MB_VAD_PREFIX_MS', 220);
 
-// Idle / Duration
-const MB_IDLE_WARNING_MS = envNumber('MB_IDLE_WARNING_MS', 40000);
-const MB_IDLE_HANGUP_MS = envNumber('MB_IDLE_HANGUP_MS', 90000);
-const MB_MAX_CALL_MS = envNumber('MB_MAX_CALL_MS', 5 * 60 * 1000);
-const MB_MAX_WARN_BEFORE_MS = envNumber('MB_MAX_WARN_BEFORE_MS', 45000);
-const MB_HANGUP_GRACE_MS = envNumber('MB_HANGUP_GRACE_MS', 3000);
+// Idle / duration
+const MB_IDLE_WARNING_MS = envNumber('MB_IDLE_WARNING_MS', 45000);
+const MB_IDLE_HANGUP_MS = envNumber('MB_IDLE_HANGUP_MS', 120000);
+const MB_MAX_CALL_MS = envNumber('MB_MAX_CALL_MS', 10 * 60 * 1000);
 
-// barge-in
-const MB_ALLOW_BARGE_IN = envBool('MB_ALLOW_BARGE_IN', true);
-const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 900);
+// Barge-in: default FALSE for noise stability
+const MB_ALLOW_BARGE_IN = envBool('MB_ALLOW_BARGE_IN', false);
+const MB_NO_BARGE_TAIL_MS = envNumber('MB_NO_BARGE_TAIL_MS', 1200);
 
-// Lead capture (שומר כמו שהיה – אבל לא חוסם)
-const MB_ENABLE_LEAD_CAPTURE = envBool('MB_ENABLE_LEAD_CAPTURE', false);
-const MB_WEBHOOK_URL = envStr('MB_WEBHOOK_URL', '');
-
-// Twilio credentials (לניתוק אקטיבי / שליפה)
+// Twilio credentials (optional)
 const TWILIO_ACCOUNT_SID = envStr('TWILIO_ACCOUNT_SID', '');
 const TWILIO_AUTH_TOKEN = envStr('TWILIO_AUTH_TOKEN', '');
 
-// Debug + always logs
-const MB_DEBUG = envBool('MB_DEBUG', true);
-const MB_LOG_LEVEL = envStr('MB_LOG_LEVEL', 'info').toLowerCase(); // info|debug
+// Logging
+const MB_LOG_LEVEL = envStr('MB_LOG_LEVEL', 'info').toLowerCase(); // debug|info|warn|error
 
 // -----------------------------
-// TTS Provider: ElevenLabs
+// ElevenLabs TTS config
 // -----------------------------
-const TTS_PROVIDER = envStr('TTS_PROVIDER', 'eleven').toLowerCase(); // eleven|openai
+const TTS_PROVIDER = envStr('TTS_PROVIDER', 'eleven').toLowerCase();
+
 const ELEVEN_API_KEY = envStr('ELEVEN_API_KEY', envStr('ELEVENLABS_API_KEY', ''));
-const ELEVEN_VOICE_ID = envStr('ELEVEN_VOICE_ID', envStr('VOICE_ID', '')); // אתה אמרת שיש לך VOICE_ID בלבד
+const ELEVEN_VOICE_ID = envStr('ELEVEN_VOICE_ID', envStr('VOICE_ID', '')); // you have VOICE_ID
 const ELEVEN_MODEL = envStr('ELEVEN_TTS_MODEL', 'eleven_v3');
 const ELEVEN_LANGUAGE = envStr('ELEVENLABS_LANGUAGE', envStr('ELEVEN_LANGUAGE', 'he'));
-const ELEVEN_OUTPUT_FORMAT = envStr('ELEVEN_OUTPUT_FORMAT', 'ulaw_8000'); // חשוב ל-Twilio media streams
+const ELEVEN_OUTPUT_FORMAT = envStr('ELEVEN_OUTPUT_FORMAT', 'ulaw_8000');
+
+// “latency” knobs
+const ELEVEN_OPTIMIZE_STREAMING_LATENCY = envNumber('ELEVEN_OPTIMIZE_STREAMING_LATENCY', 3);
+
+// voice settings
 const ELEVEN_STABILITY = envNumber('ELEVEN_STABILITY', 0.5);
 const ELEVEN_SIMILARITY = envNumber('ELEVEN_SIMILARITY', 0.75);
 const ELEVEN_STYLE = envNumber('ELEVEN_STYLE', 0.0);
 const ELEVEN_SPEAKER_BOOST = envBool('ELEVEN_SPEAKER_BOOST', true);
 
-// פתיח ישיר ב-TTS (מהיר יותר)
-const MB_OPENING_DIRECT_TTS = envBool('MB_OPENING_DIRECT_TTS', true);
+// Cached opening (pre-generated at startup)
+const MB_CACHE_OPENING_AUDIO = envBool('MB_CACHE_OPENING_AUDIO', true);
 
 // -----------------------------
-// IVRIT STT scaffolding (אופציונלי)
+// Guardrails
 // -----------------------------
-// אם תגדיר IVRIT_STT_URL, אפשר להעביר תמלול עברית אליו במקום OpenAI whisper.
-// כרגע נשאר תשתית, לא חובה להפעלה.
-const IVRIT_STT_URL = envStr('IVRIT_STT_URL', ''); // endpoint שאתה שולט עליו
-const IVRIT_STT_AUTH = envStr('IVRIT_STT_AUTH', ''); // אם צריך
-const IVRIT_STT_LANGUAGE = envStr('IVRIT_STT_LANGUAGE', 'he');
-
-if (!OPENAI_API_KEY) {
-  console.error('❌ Missing OPENAI_API_KEY in ENV.');
-}
+if (!OPENAI_API_KEY) console.error('❌ Missing OPENAI_API_KEY in ENV.');
 if (TTS_PROVIDER === 'eleven') {
   if (!ELEVEN_API_KEY) console.error('❌ Missing ELEVEN_API_KEY (or ELEVENLABS_API_KEY) in ENV.');
   if (!ELEVEN_VOICE_ID) console.error('❌ Missing VOICE_ID (or ELEVEN_VOICE_ID) in ENV.');
 }
 
 console.log(`[CONFIG] PORT=${PORT}`);
-console.log(`[CONFIG] TTS_PROVIDER=${TTS_PROVIDER}`);
-console.log(`[CONFIG] ELEVEN_MODEL=${ELEVEN_MODEL}, ELEVEN_LANGUAGE=${ELEVEN_LANGUAGE}, ELEVEN_OUTPUT_FORMAT=${ELEVEN_OUTPUT_FORMAT}`);
+console.log(`[CONFIG] MODEL=${OPENAI_REALTIME_MODEL}`);
 console.log(`[CONFIG] MB_ALLOW_BARGE_IN=${MB_ALLOW_BARGE_IN}, MB_NO_BARGE_TAIL_MS=${MB_NO_BARGE_TAIL_MS}`);
-console.log(`[CONFIG] MB_OPENING_DIRECT_TTS=${MB_OPENING_DIRECT_TTS}`);
-console.log(`[CONFIG] IVRIT_STT_URL=${IVRIT_STT_URL ? 'SET' : 'NOT_SET'}`);
+console.log(`[CONFIG] VAD threshold=${MB_VAD_THRESHOLD} silence_ms=${MB_VAD_SILENCE_MS} prefix_ms=${MB_VAD_PREFIX_MS}`);
+console.log(`[CONFIG] TTS_PROVIDER=${TTS_PROVIDER}`);
+console.log(`[CONFIG] ELEVEN voice_id=${ELEVEN_VOICE_ID ? 'SET' : 'NOT_SET'} model=${ELEVEN_MODEL} lang=${ELEVEN_LANGUAGE} fmt=${ELEVEN_OUTPUT_FORMAT} optLatency=${ELEVEN_OPTIMIZE_STREAMING_LATENCY}`);
+console.log(`[CONFIG] MB_CACHE_OPENING_AUDIO=${MB_CACHE_OPENING_AUDIO}`);
+console.log(`[CONFIG] MB_LANGUAGES=${MB_LANGUAGES.join(',')}`);
 
 // -----------------------------
-// Logging helpers (always show logs)
+// Logging helpers
 // -----------------------------
-function levelRank(lvl) {
+function rank(lvl) {
   if (lvl === 'debug') return 10;
   if (lvl === 'info') return 20;
   if (lvl === 'warn') return 30;
   if (lvl === 'error') return 40;
   return 20;
 }
-const CURRENT_LVL = levelRank(MB_LOG_LEVEL);
+const CUR = rank(MB_LOG_LEVEL);
 
 function log(lvl, tag, msg, extra, meta = {}) {
-  if (levelRank(lvl) < CURRENT_LVL) return;
+  if (rank(lvl) < CUR) return;
   const ts = new Date().toISOString();
   const ridPart = meta && meta.rid ? ` { rid: '${meta.rid}' }` : '';
-  if (extra !== undefined) {
-    console.log(`[${ts}][${lvl.toUpperCase()}][${tag}] ${msg}${ridPart}`, extra);
-  } else {
-    console.log(`[${ts}][${lvl.toUpperCase()}][${tag}] ${msg}${ridPart}`);
-  }
+  if (extra !== undefined) console.log(`[${ts}][${lvl.toUpperCase()}][${tag}] ${msg}${ridPart}`, extra);
+  else console.log(`[${ts}][${lvl.toUpperCase()}][${tag}] ${msg}${ridPart}`);
 }
-const logInfo = (tag, msg, extra, meta) => log('info', tag, msg, extra, meta);
-const logWarn = (tag, msg, extra, meta) => log('warn', tag, msg, extra, meta);
-const logError = (tag, msg, extra, meta) => log('error', tag, msg, extra, meta);
 const logDebug = (tag, msg, extra, meta) => log('debug', tag, msg, extra, meta);
+const logInfo  = (tag, msg, extra, meta) => log('info',  tag, msg, extra, meta);
+const logWarn  = (tag, msg, extra, meta) => log('warn',  tag, msg, extra, meta);
+const logError = (tag, msg, extra, meta) => log('error', tag, msg, extra, meta);
 
 // -----------------------------
-// System instructions builder
+// System instructions
 // -----------------------------
 const EXTRA_BEHAVIOR_RULES = `
-חוקי מערכת קבועים (גבוהים מהפרומפט העסקי):
-1. אל תתייחסי למוזיקה, רעשים או איכות הקו. אם לא הבנת: "לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?"
-2. אל תסיימי שיחה בעצמך. סיימי רק כשמבקשים ממך במפורש או בטיימאאוטים.
-3. תשובות קצרות: 1–3 משפטים.
-4. בסוף טבעי – שאלי: "רֶגַע לִפְנֵי שֶׁאֲנִי מְסַיֶּמֶת, יֵשׁ עוֹד מַשֶּׁהוּ שֶׁתִּרְצוּ?"
+חוקי מערכת קבועים:
+1) דברו בעברית כברירת מחדל, לשון רבים, טון חם וקצר.
+2) אל תתייחסי לרעש/איכות קו. אם לא הבנת: "לֹא שָׁמַעְתִּי טוֹב, אֶפְשָׁר לַחֲזוֹר עַל זֶה?"
+3) תשובות קצרות 1–3 משפטים, וסיימי בשאלה שמקדמת הבנה/איסוף צורך.
+4) אל תסיימי שיחה מיוזמתך.
 `.trim();
 
 function buildSystemInstructions() {
   const base = (MB_GENERAL_PROMPT || '').trim();
   const kb = (MB_BUSINESS_PROMPT || '').trim();
+
   let instructions = '';
   if (base) instructions += base;
   if (kb) instructions += (instructions ? '\n\n' : '') + kb;
+
   if (!instructions) {
     instructions = `
-אתם עוזר קולי בזמן אמת בשם "${BOT_NAME}" עבור העסק "${BUSINESS_NAME}".
-דברו בטון נעים ומקצועי, תשובות קצרות, ברירת מחדל עברית.
+אתם עוזר קולי בשם "${BOT_NAME}" עבור "${BUSINESS_NAME}".
+דברו בעברית כברירת מחדל, תשובות קצרות ומקצועיות.
 `.trim();
   }
-  instructions += '\n\n' + EXTRA_BEHAVIOR_RULES;
-  return instructions;
+
+  return instructions + '\n\n' + EXTRA_BEHAVIOR_RULES;
 }
 
 // -----------------------------
-// Twilio hangup + fetch caller
-// -----------------------------
-async function hangupTwilioCall(callSid, meta) {
-  if (!callSid) return;
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
-  try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
-    const body = new URLSearchParams({ Status: 'completed' });
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization:
-          'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'),
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body
-    });
-    if (!res.ok) {
-      logError('Call', `Twilio hangup HTTP ${res.status}`, await res.text().catch(() => ''), meta);
-    } else {
-      logInfo('Call', 'Twilio call hangup requested successfully.', undefined, meta);
-    }
-  } catch (e) {
-    logError('Call', 'Error calling Twilio hangup API', e, meta);
-  }
-}
-
-async function fetchCallerNumberFromTwilio(callSid, meta) {
-  if (!callSid) return null;
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return null;
-  try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Authorization:
-          'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64')
-      }
-    });
-    if (!res.ok) {
-      logError('Call', `fetchCallerNumberFromTwilio HTTP ${res.status}`, await res.text().catch(() => ''), meta);
-      return null;
-    }
-    const data = await res.json();
-    const fromRaw = data.from || data.caller_name || null;
-    logInfo('Call', `fetchCallerNumberFromTwilio: resolved caller="${fromRaw}" from Twilio Call resource.`, undefined, meta);
-    return fromRaw;
-  } catch (e) {
-    logError('Call', 'fetchCallerNumberFromTwilio: error', e, meta);
-    return null;
-  }
-}
-
-// -----------------------------
-// AudioSender: send ulaw_8000 in 20ms frames
+// Audio sender (Twilio expects 20ms frames at 8k ulaw = 160 bytes)
 // -----------------------------
 function createAudioSender(connection, meta) {
   const state = {
     streamSid: null,
     timer: null,
     queue: [],
-    sending: false
   };
 
   function bindStreamSid(streamSid) {
     state.streamSid = streamSid;
     logInfo('AudioSender', 'Bound sender.streamSid', { streamSid }, meta);
+    start();
   }
 
-  function enqueueUlawBuffer(buf) {
+  function enqueue(buf) {
     if (!buf || !Buffer.isBuffer(buf) || buf.length === 0) return;
     state.queue.push(buf);
-    start();
   }
 
   function start() {
@@ -280,8 +217,7 @@ function createAudioSender(connection, meta) {
       if (connection.readyState !== WebSocket.OPEN) return;
       if (state.queue.length === 0) return;
 
-      // Twilio expects 20ms frames: 8kHz ulaw => 160 bytes
-      const frameSize = 160;
+      const frameSize = 160; // 20ms
       let cur = state.queue[0];
 
       if (cur.length <= frameSize) {
@@ -311,21 +247,27 @@ function createAudioSender(connection, meta) {
     }
   }
 
-  return { bindStreamSid, enqueueUlawBuffer, stop };
+  return { bindStreamSid, enqueue, stop };
 }
 
 // -----------------------------
-// ElevenLabs TTS
+// ElevenLabs streaming TTS -> push to AudioSender as chunks arrive
 // -----------------------------
-async function elevenTts(text, reason, meta) {
+async function elevenTtsStreamToSender(text, reason, sender, meta) {
   if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
     logError('ElevenTTS', 'Missing ELEVEN_API_KEY or VOICE_ID', undefined, meta);
-    return null;
+    return false;
   }
   const cleaned = String(text || '').trim();
-  if (!cleaned) return null;
+  if (!cleaned) return false;
 
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_VOICE_ID)}`;
+  const baseUrl = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_VOICE_ID)}`;
+  const qs = new URLSearchParams({
+    output_format: ELEVEN_OUTPUT_FORMAT,
+    language: ELEVEN_LANGUAGE,
+    optimize_streaming_latency: String(ELEVEN_OPTIMIZE_STREAMING_LATENCY),
+  });
+  const url = `${baseUrl}?${qs.toString()}`;
 
   const body = {
     text: cleaned,
@@ -338,73 +280,118 @@ async function elevenTts(text, reason, meta) {
     }
   };
 
-  // יש מודלים שלא תומכים בפרמטרים מסוימים – לא שולחים optimize_streaming_latency בכלל
-  const headers = {
-    'xi-api-key': ELEVEN_API_KEY,
-    'Content-Type': 'application/json',
-    Accept: 'audio/mpeg'
-  };
-
-  // פורמט: ulaw_8000 -> מתאים ישירות ל-Twilio Media Streams
-  // Eleven תומכים ב-output_format דרך query string:
-  // https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=ulaw_8000
-  const urlWithFmt = `${url}?output_format=${encodeURIComponent(ELEVEN_OUTPUT_FORMAT)}&language=${encodeURIComponent(ELEVEN_LANGUAGE)}`;
-
-  logInfo('ElevenTTS', 'Sending text to ElevenLabs TTS.', {
-    rid: meta.rid,
+  logInfo('ElevenTTS', 'Streaming text to ElevenLabs TTS.', {
     length: cleaned.length,
     model: ELEVEN_MODEL,
     language: ELEVEN_LANGUAGE,
     format: ELEVEN_OUTPUT_FORMAT,
-    stability: ELEVEN_STABILITY,
     reason
   }, meta);
 
   try {
-    const res = await fetch(urlWithFmt, { method: 'POST', headers, body: JSON.stringify(body) });
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': ELEVEN_API_KEY,
+        'Content-Type': 'application/json',
+        // We expect audio bytes back (ulaw_8000)
+        Accept: 'audio/*',
+      },
+      body: JSON.stringify(body)
+    });
+
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
-      logError('ElevenTTS', `ElevenLabs TTS HTTP ${res.status}`, txt, meta);
-      return null;
+      logError('ElevenTTS', `HTTP ${res.status}`, txt, meta);
+      return false;
     }
-    const arr = await res.arrayBuffer();
-    const buf = Buffer.from(arr);
-    logInfo('ElevenTTS', `ElevenLabs TTS audio received total=${buf.length} bytes`, undefined, meta);
-    return buf;
+
+    if (!res.body) {
+      // fallback: buffer all
+      const arr = await res.arrayBuffer();
+      sender.enqueue(Buffer.from(arr));
+      logWarn('ElevenTTS', 'No streaming body; buffered entire audio.', { bytes: Buffer.from(arr).length }, meta);
+      return true;
+    }
+
+    // STREAM: read chunks and enqueue immediately
+    const reader = res.body.getReader();
+    let total = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value && value.length) {
+        const buf = Buffer.from(value);
+        total += buf.length;
+        sender.enqueue(buf);
+      }
+    }
+
+    logInfo('ElevenTTS', `Stream done. total=${total} bytes`, undefined, meta);
+    return true;
   } catch (e) {
-    logError('ElevenTTS', 'ElevenLabs TTS fetch error', e, meta);
-    return null;
+    logError('ElevenTTS', 'Streaming error', e, meta);
+    return false;
   }
 }
 
 // -----------------------------
-// IVRIT STT (placeholder) - not enabled by default
+// Cached opening audio (generated once at startup)
 // -----------------------------
-async function ivritTranscribeBase64Ulaw8k(b64, meta) {
-  if (!IVRIT_STT_URL) return null;
+let OPENING_AUDIO_CACHE = null; // Buffer in ulaw_8000
+async function warmupOpeningCache() {
+  if (!MB_CACHE_OPENING_AUDIO) return;
+  if (TTS_PROVIDER !== 'eleven') return;
+  if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) return;
+
+  // We warmup by fetching full audio once (buffered) - safe & simple
   try {
-    const res = await fetch(IVRIT_STT_URL, {
+    const baseUrl = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVEN_VOICE_ID)}`;
+    const qs = new URLSearchParams({
+      output_format: ELEVEN_OUTPUT_FORMAT,
+      language: ELEVEN_LANGUAGE,
+      optimize_streaming_latency: String(ELEVEN_OPTIMIZE_STREAMING_LATENCY),
+    });
+    const url = `${baseUrl}?${qs.toString()}`;
+
+    const body = {
+      text: String(MB_OPENING_SCRIPT || '').trim(),
+      model_id: ELEVEN_MODEL,
+      voice_settings: {
+        stability: ELEVEN_STABILITY,
+        similarity_boost: ELEVEN_SIMILARITY,
+        style: ELEVEN_STYLE,
+        use_speaker_boost: ELEVEN_SPEAKER_BOOST
+      }
+    };
+
+    logInfo('Startup', 'Warming opening audio cache with ElevenLabs...', {
+      model: ELEVEN_MODEL,
+      lang: ELEVEN_LANGUAGE,
+      fmt: ELEVEN_OUTPUT_FORMAT,
+      len: (MB_OPENING_SCRIPT || '').length
+    });
+
+    const res = await fetch(url, {
       method: 'POST',
       headers: {
+        'xi-api-key': ELEVEN_API_KEY,
         'Content-Type': 'application/json',
-        ...(IVRIT_STT_AUTH ? { Authorization: IVRIT_STT_AUTH } : {})
+        Accept: 'audio/*'
       },
-      body: JSON.stringify({
-        audio_b64: b64,
-        format: 'g711_ulaw_8000',
-        language: IVRIT_STT_LANGUAGE
-      })
+      body: JSON.stringify(body)
     });
+
     if (!res.ok) {
-      logError('IVRIT', `IVRIT_STT HTTP ${res.status}`, await res.text().catch(() => ''), meta);
-      return null;
+      logWarn('Startup', `Opening cache warmup failed HTTP ${res.status}`, await res.text().catch(() => ''));
+      return;
     }
-    const data = await res.json().catch(() => null);
-    if (!data || typeof data.text !== 'string') return null;
-    return data.text.trim();
+
+    const arr = await res.arrayBuffer();
+    OPENING_AUDIO_CACHE = Buffer.from(arr);
+    logInfo('Startup', `Opening audio cached. bytes=${OPENING_AUDIO_CACHE.length}`);
   } catch (e) {
-    logError('IVRIT', 'IVRIT_STT error', e, meta);
-    return null;
+    logWarn('Startup', 'Opening cache warmup error', e);
   }
 }
 
@@ -415,23 +402,15 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// basic health
+// health
 app.get('/', (req, res) => res.status(200).send('OK'));
 
-// request logging
-app.use((req, res, next) => {
-  const id = crypto.randomBytes(4).toString('hex');
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
-  logInfo('HTTP', `--> [${id}] ${req.method} ${req.path} ip=${ip}`);
-  res.on('finish', () => logInfo('HTTP', `<-- [${id}] ${req.method} ${req.path} status=${res.statusCode}`));
-  next();
-});
-
-// Twilio Voice webhook – TwiML that connects Media Streams
+// Twilio voice webhook -> Stream
 app.post('/twilio-voice', (req, res) => {
   const host = (DOMAIN || req.headers.host || '').replace(/^https?:\/\//, '');
   const wsUrl = MB_TWILIO_STREAM_URL || `wss://${host}/twilio-media-stream`;
   const caller = req.body.From || '';
+
   const twiml = `
 <?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -442,7 +421,6 @@ app.post('/twilio-voice', (req, res) => {
   </Connect>
 </Response>`.trim();
 
-  logInfo('Twilio-Voice', `Returning TwiML with Stream URL: ${wsUrl}, From=${caller}`);
   res.type('text/xml').send(twiml);
 });
 
@@ -450,52 +428,89 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/twilio-media-stream' });
 
 // -----------------------------
+// Twilio hangup + fetch caller (optional)
+// -----------------------------
+async function hangupTwilioCall(callSid, meta) {
+  if (!callSid) return;
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${TWILIO_ACCOUNT_SID ? callSid : ''}.json`;
+    // (guard)
+    const realUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
+    const body = new URLSearchParams({ Status: 'completed' });
+
+    const res = await fetch(realUrl, {
+      method: 'POST',
+      headers: {
+        Authorization:
+          'Basic ' + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64'),
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body
+    });
+
+    if (!res.ok) {
+      logWarn('Call', `Twilio hangup HTTP ${res.status}`, await res.text().catch(() => ''), meta);
+    } else {
+      logInfo('Call', 'Twilio call hangup requested successfully.', undefined, meta);
+    }
+  } catch (e) {
+    logWarn('Call', 'Twilio hangup error', e, meta);
+  }
+}
+
+// -----------------------------
 // Per-call handler
 // -----------------------------
 wss.on('connection', (connection) => {
   const meta = { rid: rid() };
 
-  logInfo('Call', 'New Twilio Media Stream connection established.', meta, meta);
+  logInfo('Call', 'New Twilio Media Stream connection established.', undefined, meta);
 
   if (!OPENAI_API_KEY) {
-    logError('Call', 'OPENAI_API_KEY missing – closing connection.', undefined, meta);
+    logError('Call', 'OPENAI_API_KEY missing – closing.', undefined, meta);
     try { connection.close(); } catch {}
     return;
   }
 
-  // call state
+  const sender = createAudioSender(connection, meta);
+
   let streamSid = null;
   let callSid = null;
-  let callerNumber = null;
-
-  let callStartTs = Date.now();
-  let lastMediaTs = Date.now();
-
-  let idleCheckInterval = null;
-  let maxCallTimeout = null;
-  let maxCallWarningTimeout = null;
+  let caller = null;
 
   let callEnded = false;
-  let twilioClosed = false;
-  let openAiClosed = false;
+  let lastMediaTs = Date.now();
 
-  // response control
   let hasActiveResponse = false;
-  let botSpeaking = false;
   let botTurnActive = false;
+  let botSpeaking = false;
   let noListenUntilTs = 0;
 
-  // user transcript queue to avoid conversation_already_has_active_response
+  // queue for user texts to avoid “active response” errors
   const pendingUserTexts = [];
-  let lastUserTextAt = 0;
-  let lastBotAudioAt = 0;
+
+  // de-dup transcripts
+  let lastTranscript = '';
+  let lastTranscriptAt = 0;
 
   const conversationLog = [];
 
-  // Audio sender for Twilio
-  const sender = createAudioSender(connection, meta);
+  function endCall(reason) {
+    if (callEnded) return;
+    callEnded = true;
 
-  // OpenAI WS (LLM + (optional) whisper transcription)
+    logInfo('Call', `endCall reason="${reason}"`, undefined, meta);
+    logInfo('Call', 'Final conversation log:', conversationLog, meta);
+
+    try { sender.stop(); } catch {}
+
+    if (callSid) hangupTwilioCall(callSid, meta).catch(() => {});
+    try { if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close(); } catch {}
+    try { if (connection.readyState === WebSocket.OPEN) connection.close(); } catch {}
+  }
+
+  // ---- OpenAI WS
   const openAiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
     {
@@ -506,59 +521,21 @@ wss.on('connection', (connection) => {
     }
   );
 
-  function safeCloseAll(reason) {
-    if (callEnded) return;
-    callEnded = true;
-
-    logInfo('Call', `endCall called with reason="${reason}"`, undefined, meta);
-    logInfo('Call', 'Final conversation log:', conversationLog, meta);
-
-    if (idleCheckInterval) clearInterval(idleCheckInterval);
-    if (maxCallTimeout) clearTimeout(maxCallTimeout);
-    if (maxCallWarningTimeout) clearTimeout(maxCallWarningTimeout);
-
-    // hangup
-    if (callSid) hangupTwilioCall(callSid, meta).catch(() => {});
-
-    // close sockets
-    try {
-      sender.stop();
-    } catch {}
-    try {
-      if (!openAiClosed && openAiWs.readyState === WebSocket.OPEN) {
-        openAiClosed = true;
-        openAiWs.close();
-      }
-    } catch {}
-    try {
-      if (!twilioClosed && connection.readyState === WebSocket.OPEN) {
-        twilioClosed = true;
-        connection.close();
-      }
-    } catch {}
-  }
-
-  // ---- OpenAI helpers
   function sendUserTextToModel(text, reason) {
     const t = String(text || '').trim();
     if (!t) return;
 
-    // always create a user item, then response.create
     if (openAiWs.readyState !== WebSocket.OPEN) {
-      logWarn('Call', 'OpenAI WS not open – cannot send user text.', { reason }, meta);
+      logWarn('OpenAI', 'WS not open; cannot send user text yet', { reason }, meta);
+      pendingUserTexts.push(t);
       return;
     }
 
-    const itemEvt = {
+    // Create a user message item and then response.create
+    openAiWs.send(JSON.stringify({
       type: 'conversation.item.create',
-      item: {
-        type: 'message',
-        role: 'user',
-        content: [{ type: 'input_text', text: t }]
-      }
-    };
-
-    openAiWs.send(JSON.stringify(itemEvt));
+      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: t }] }
+    }));
     openAiWs.send(JSON.stringify({ type: 'response.create' }));
 
     hasActiveResponse = true;
@@ -566,55 +543,25 @@ wss.on('connection', (connection) => {
     logInfo('Call', 'response.create sent', { reason }, meta);
   }
 
-  function maybeSendNextFromQueue(trigger) {
+  function flushQueue(trigger) {
     if (callEnded) return;
-    if (hasActiveResponse) {
-      logDebug('Call', 'Skip send (response already in flight)', { trigger }, meta);
-      return;
-    }
-    if (pendingUserTexts.length === 0) return;
-
+    if (hasActiveResponse) return;
+    if (!pendingUserTexts.length) return;
     const next = pendingUserTexts.shift();
     sendUserTextToModel(next, `queued:${trigger}`);
   }
 
-  // “לא שמעתי טוב” רק אם באמת אין כלום
-  async function maybeNoUserTextNudge() {
-    if (callEnded) return;
-
-    const now = Date.now();
-    const sinceUser = now - (lastUserTextAt || callStartTs);
-
-    // אם הלקוח דיבר לאחרונה – לא לנג'ס
-    if (sinceUser < 6500) return;
-
-    // אם הבוט באמצע response/דיבור – לא לנג'ס
-    if (hasActiveResponse || botSpeaking || botTurnActive) return;
-
-    // נודג' קצר
-    const nudge = 'לֹא שָׁמַעְתִּי טוֹב. אֶפְשָׁר לַחֲזוֹר עַל זֶה בְּמִשְׁפָּט קָצָר?';
-    conversationLog.push({ from: 'bot', text: 'לא שמעתי טוב, אפשר לחזור על זה?' });
-    const audio = await elevenTts(nudge, 'no_user_text', meta);
-    if (audio) {
-      sender.enqueueUlawBuffer(audio);
-      lastBotAudioAt = Date.now();
-    }
-  }
-
-  // ---- OpenAI WS handlers
   openAiWs.on('open', () => {
     logInfo('Call', 'Connected to OpenAI Realtime API.', undefined, meta);
 
     const instructions = buildSystemInstructions();
 
-    // session.update
-    const sessionUpdate = {
+    // session.update – NOTE: we keep whisper transcription ON
+    openAiWs.send(JSON.stringify({
       type: 'session.update',
       session: {
         model: OPENAI_REALTIME_MODEL,
         modalities: ['text', 'audio'],
-        // אנחנו עדיין מאפשרים whisper כדי לקבל transcript_completed
-        // אם בעתיד נעבור ל-IVRIT: נבטל פה transcription וננהל לבד.
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         input_audio_transcription: { model: 'whisper-1' },
@@ -626,253 +573,221 @@ wss.on('connection', (connection) => {
         },
         instructions
       }
-    };
+    }));
 
-    openAiWs.send(JSON.stringify(sessionUpdate));
-
-    // פתיח: Eleven ישירות (מהיר יותר)
-    if (MB_OPENING_DIRECT_TTS && TTS_PROVIDER === 'eleven') {
-      (async () => {
-        conversationLog.push({ from: 'bot', text: MB_OPENING_SCRIPT });
-        const audio = await elevenTts(MB_OPENING_SCRIPT, 'opening_greeting', meta);
-        if (audio) {
-          sender.enqueueUlawBuffer(audio);
-          lastBotAudioAt = Date.now();
-        }
-      })().catch((e) => logError('Call', 'Opening direct TTS failed', e, meta));
-    } else {
-      // fallback: אם רוצים פתיח מהמודל
-      pendingUserTexts.push(`פתחי את השיחה במשפט הבא בלבד: "${MB_OPENING_SCRIPT}"`);
-      maybeSendNextFromQueue('opening');
-    }
+    // If we had queued texts before WS open:
+    flushQueue('open');
   });
 
+  openAiWs.on('close', () => {
+    logInfo('Call', 'OpenAI WS closed.', undefined, meta);
+    if (!callEnded) endCall('openai_ws_closed');
+  });
+
+  openAiWs.on('error', (err) => {
+    logError('Call', 'OpenAI WS error', err, meta);
+    if (!callEnded) endCall('openai_ws_error');
+  });
+
+  // Collect ONLY output_text deltas (avoid duplicates)
   let currentBotText = '';
+  let gotAnyOutputTextDelta = false;
 
   openAiWs.on('message', async (data) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch (e) {
-      logError('OpenAI', 'Failed to parse OpenAI message', e, meta);
-      return;
-    }
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
     const type = msg.type;
 
     if (type === 'response.created') {
       hasActiveResponse = true;
       botTurnActive = true;
+      botSpeaking = false;
       currentBotText = '';
+      gotAnyOutputTextDelta = false;
       return;
     }
 
-    if (type === 'response.output_text.delta' || type === 'response.audio_transcript.delta') {
+    // IMPORTANT: ONLY output_text delta
+    if (type === 'response.output_text.delta') {
       const d = msg.delta || '';
-      if (d) currentBotText += d;
+      if (d) {
+        currentBotText += d;
+        gotAnyOutputTextDelta = true;
+      }
       return;
     }
 
-    if (type === 'response.output_text.done' || type === 'response.audio_transcript.done') {
-      const text = (currentBotText || '').trim();
+    // Ignore audio_transcript events (they cause duplicate “same text” in many flows)
+    if (type === 'response.audio_transcript.delta' || type === 'response.audio_transcript.done') {
+      return;
+    }
+
+    if (type === 'response.output_text.done') {
+      const text = String(currentBotText || '').trim();
+      currentBotText = '';
+
       if (text) {
         conversationLog.push({ from: 'bot', text });
         logInfo('Bot', text, undefined, meta);
 
-        // TTS: Eleven speaks the model text
+        // Stream Eleven audio immediately (no buffering)
         if (TTS_PROVIDER === 'eleven') {
-          const audio = await elevenTts(text, 'model_reply', meta);
-          if (audio) {
-            sender.enqueueUlawBuffer(audio);
-            lastBotAudioAt = Date.now();
-          }
-        } else {
-          // אם אי פעם תחזור ל-openai voice: כאן היינו שולחים audio deltas
-          // כרגע לא משתמשים.
+          botSpeaking = true;
+          await elevenTtsStreamToSender(text, 'model_reply', sender, meta);
+          botSpeaking = false;
+          noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
         }
       }
-      currentBotText = '';
+
       return;
     }
 
     if (type === 'response.completed' || type === 'response.audio.done') {
       hasActiveResponse = false;
-      botSpeaking = false;
       botTurnActive = false;
+      botSpeaking = false;
       noListenUntilTs = Date.now() + MB_NO_BARGE_TAIL_MS;
-
-      // אם יש טקסטים בתור – ממשיכים
-      maybeSendNextFromQueue('response_completed');
+      flushQueue('response_completed');
       return;
     }
 
     if (type === 'conversation.item.input_audio_transcription.completed') {
-      // קיבלנו תמלול מהלקוח
-      const tRaw = (msg.transcript || '').trim();
-      if (!tRaw) return;
+      const t = String(msg.transcript || '').trim();
+      if (!t) return;
 
-      const t = tRaw.replace(/\s+/g, ' ').trim();
-      lastUserTextAt = Date.now();
+      const now = Date.now();
+      // De-dupe same transcript bursts
+      if (t === lastTranscript && (now - lastTranscriptAt) < 800) return;
+      lastTranscript = t;
+      lastTranscriptAt = now;
 
       conversationLog.push({ from: 'user', text: t });
       logInfo('User', t, undefined, meta);
 
-      // IMPORTANT:
-      // לא שולחים response.create אם יש response פעיל — מכניסים לתור
+      // If response in flight -> queue
       if (hasActiveResponse) {
         pendingUserTexts.push(t);
-        logWarn('Call', 'User spoke while response in flight -> queued', undefined, meta);
+        logDebug('Call', 'Queued user text (response in flight).', { qlen: pendingUserTexts.length }, meta);
         return;
       }
 
-      // שליחה מיידית למודל (הדרך הנכונה)
       sendUserTextToModel(t, 'transcript_completed');
       return;
     }
 
     if (type === 'error') {
-      logError('OpenAI', 'OpenAI error event', { evt: msg }, meta);
-
-      // מקרה מוכר: conversation_already_has_active_response
       const code = msg?.error?.code;
-      if (code === 'conversation_already_has_active_response') {
-        // לא עושים כלום, התור שלנו יטפל.
-        return;
-      }
-      if (code === 'response_cancel_not_active') {
-        // מתעלמים – זה קורה אם ניסו cancel בלי response פעיל
-        return;
-      }
+      logWarn('OpenAI', 'OpenAI error event', { code, message: msg?.error?.message }, meta);
 
-      // אם זו שגיאה אחרת קשה – נסגור כדי לא להיתקע שקט
+      // we handle these gracefully by queueing/ignoring
+      if (code === 'conversation_already_has_active_response') return;
+      if (code === 'response_cancel_not_active') return;
+
+      // other errors -> allow next queue attempt
       hasActiveResponse = false;
-      botSpeaking = false;
       botTurnActive = false;
+      botSpeaking = false;
+      flushQueue('error_recover');
       return;
     }
-  });
-
-  openAiWs.on('close', () => {
-    openAiClosed = true;
-    logInfo('Call', 'OpenAI WS closed.', undefined, meta);
-    if (!callEnded) safeCloseAll('openai_ws_closed');
-  });
-
-  openAiWs.on('error', (err) => {
-    logError('Call', 'OpenAI WS error', err, meta);
-    if (!openAiClosed) {
-      openAiClosed = true;
-      try { openAiWs.close(); } catch {}
-    }
-    if (!callEnded) safeCloseAll('openai_ws_error');
   });
 
   // ---- Twilio Media Stream handlers
+  let idleInterval = null;
+
   connection.on('message', async (data) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch (e) {
-      logError('Call', 'Failed to parse Twilio WS message', e, meta);
-      return;
-    }
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
-    const event = msg.event;
-
-    if (event === 'start') {
+    if (msg.event === 'start') {
       streamSid = msg.start?.streamSid || null;
       callSid = msg.start?.callSid || null;
-      callerNumber = msg.start?.customParameters?.caller || null;
-
-      callStartTs = Date.now();
-      lastMediaTs = Date.now();
+      caller = msg.start?.customParameters?.caller || null;
 
       sender.bindStreamSid(streamSid);
+      lastMediaTs = Date.now();
 
-      logInfo(
-        'Call',
-        `Twilio stream started. streamSid=${streamSid}, callSid=${callSid}, caller=${callerNumber}`,
-        undefined,
-        meta
-      );
+      logInfo('Call', `Twilio stream started. streamSid=${streamSid}, callSid=${callSid}, caller=${caller}`, undefined, meta);
 
-      idleCheckInterval = setInterval(() => {
-        const now = Date.now();
-        const sinceMedia = now - lastMediaTs;
+      // PLAY OPENING IMMEDIATELY:
+      // If cached, enqueue right now (best latency).
+      // Otherwise stream from Eleven right now.
+      conversationLog.push({ from: 'bot', text: MB_OPENING_SCRIPT });
 
-        if (sinceMedia >= MB_IDLE_WARNING_MS) {
-          // "נודג'" עדין – אבל רק אם באמת אין שיחה
-          maybeNoUserTextNudge().catch(() => {});
+      if (TTS_PROVIDER === 'eleven') {
+        if (OPENING_AUDIO_CACHE && OPENING_AUDIO_CACHE.length) {
+          logInfo('Opening', 'Playing cached opening audio.', { bytes: OPENING_AUDIO_CACHE.length }, meta);
+          sender.enqueue(Buffer.from(OPENING_AUDIO_CACHE)); // copy
+        } else {
+          logInfo('Opening', 'No cache; streaming opening from Eleven now.', undefined, meta);
+          await elevenTtsStreamToSender(MB_OPENING_SCRIPT, 'opening_greeting', sender, meta);
         }
-        if (sinceMedia >= MB_IDLE_HANGUP_MS) {
-          logInfo('Call', 'Idle timeout reached -> hanging up', undefined, meta);
-          safeCloseAll('idle_timeout');
+      }
+
+      // Idle watchdog
+      if (idleInterval) clearInterval(idleInterval);
+      idleInterval = setInterval(() => {
+        const since = Date.now() - lastMediaTs;
+        if (since > MB_IDLE_HANGUP_MS) {
+          logInfo('Call', 'Idle hangup.', { sinceMs: since }, meta);
+          endCall('idle_timeout');
         }
       }, 1000);
 
-      // Max call duration + warning
+      // Max call duration
       if (MB_MAX_CALL_MS > 0) {
-        if (MB_MAX_WARN_BEFORE_MS > 0 && MB_MAX_CALL_MS > MB_MAX_WARN_BEFORE_MS) {
-          maxCallWarningTimeout = setTimeout(async () => {
-            const t = 'אנחנו מתקרבים לסיום הזמן לשיחה הזאת. אם תרצו להתקדם, אפשר עכשיו לסכם ולהשאיר פרטים.';
-            conversationLog.push({ from: 'bot', text: t });
-            const audio = await elevenTts(t, 'max_call_warning', meta);
-            if (audio) sender.enqueueUlawBuffer(audio);
-          }, MB_MAX_CALL_MS - MB_MAX_WARN_BEFORE_MS);
-        }
-
-        maxCallTimeout = setTimeout(() => {
-          logInfo('Call', 'Max call duration reached -> hanging up', undefined, meta);
-          safeCloseAll('max_call_duration');
+        setTimeout(() => {
+          if (!callEnded) endCall('max_call_duration');
         }, MB_MAX_CALL_MS);
       }
 
       return;
     }
 
-    if (event === 'media') {
+    if (msg.event === 'media') {
       lastMediaTs = Date.now();
       const payload = msg.media?.payload;
       if (!payload) return;
 
-      // Barge-in handling: אם לא מאפשרים – לא מעבירים אודיו בזמן דיבור הבוט
+      if (openAiWs.readyState !== WebSocket.OPEN) return;
+
       const now = Date.now();
+
+      // If barge-in is OFF: ignore user audio while bot is speaking or in tail
       if (!MB_ALLOW_BARGE_IN) {
-        if (botTurnActive || botSpeaking || now < noListenUntilTs) return;
+        if (botTurnActive || botSpeaking || now < noListenUntilTs) {
+          return;
+        }
       }
 
-      // אם בעתיד תפעיל IVRIT STT, כאן אפשר לאסוף אודיו למקטעים.
-      // כרגע: פשוט מעבירים ל-OpenAI Realtime כדי לקבל transcript_completed.
-      if (openAiWs.readyState === WebSocket.OPEN) {
-        openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
-      }
+      // forward audio to OpenAI for transcription
+      openAiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: payload }));
       return;
     }
 
-    if (event === 'stop') {
+    if (msg.event === 'stop') {
       logInfo('Call', 'Twilio stream stopped.', undefined, meta);
-      twilioClosed = true;
-      if (!callEnded) safeCloseAll('twilio_stop');
+      if (!callEnded) endCall('twilio_stop');
       return;
     }
   });
 
   connection.on('close', () => {
-    twilioClosed = true;
     logInfo('Call', 'Twilio WS closed.', undefined, meta);
-    if (!callEnded) safeCloseAll('twilio_ws_closed');
+    if (!callEnded) endCall('twilio_ws_closed');
   });
 
   connection.on('error', (err) => {
-    twilioClosed = true;
     logError('Call', 'Twilio WS error', err, meta);
-    if (!callEnded) safeCloseAll('twilio_ws_error');
+    if (!callEnded) endCall('twilio_ws_error');
   });
 });
 
 // -----------------------------
 // Start server
 // -----------------------------
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`✅ BluBinet Realtime Voice Bot running on port ${PORT} (TTS_PROVIDER=${TTS_PROVIDER})`);
+  await warmupOpeningCache();
 });
