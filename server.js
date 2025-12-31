@@ -6,20 +6,17 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// הגדרות שליטה מה-ENV
 const VOICE_NAME = process.env.MB_VOICE_NAME || 'Aoede'; 
 const BOT_NAME = process.env.MB_BOT_NAME || 'נטע';
 const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || 'BluBinet';
 
 const SYSTEM_INSTRUCTIONS = `
 You are an AI assistant named ${BOT_NAME} for ${BUSINESS_NAME}.
-You must be helpful and professional.
-Respond in the language the user speaks to you (Hebrew, English, Russian, or Arabic).
-Keep responses concise (1-3 sentences).
+Respond in the language the user speaks to you. Keep it short.
 `.trim();
 
 const app = express();
-app.get('/', (req, res) => res.send('BluBinet Gemini Bot is Online'));
+app.get('/', (req, res) => res.send('BluBinet is Up'));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/twilio-media-stream' });
@@ -30,51 +27,42 @@ wss.on('connection', (ws) => {
     let geminiWs = null;
 
     const connectToGemini = () => {
-        // כתובת URL מעודכנת ופשוטה יותר עבור ה-Live API
+        // ניסיון עם ה-URL המקוצר והישיר ביותר
         const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidirectionalGenerateContent?key=${GEMINI_API_KEY}`;
         
         geminiWs = new WebSocket(url);
 
         geminiWs.on('open', () => {
-            console.log('Gemini: Connection established');
+            console.log('Gemini: Socket Opened');
             
+            // הודעת SETUP מינימלית
             const setupMessage = {
                 setup: {
-                    model: "models/gemini-2.0-flash-exp",
-                    generation_config: { 
-                        response_modalities: ["audio"]
-                    },
-                    speech_config: {
-                        voice_config: { 
-                            prebuilt_voice_config: { 
-                                voice_name: VOICE_NAME 
-                            } 
-                        }
-                    }
+                    model: "models/gemini-2.0-flash-exp"
                 }
             };
-            
-            // שליחת ה-Setup
             geminiWs.send(JSON.stringify(setupMessage));
-
-            // שליחת הוראות המערכת כהודעה ראשונה (או בתוך ה-Setup אם השרת תומך)
-            const firstMessage = {
-                client_content: {
-                    turns: [{
-                        role: "user",
-                        parts: [{ text: SYSTEM_INSTRUCTIONS }]
-                    }],
-                    turn_complete: true
-                }
-            };
-            geminiWs.send(JSON.stringify(firstMessage));
         });
 
         geminiWs.on('message', (data) => {
             try {
                 const response = JSON.parse(data);
                 
-                // טיפול באודיו שחוזר מ-Gemini
+                // אם קיבלנו אישור SETUP, נשלח את הקונפיגורציה
+                if (response.setupComplete) {
+                    console.log('Gemini: Setup Complete');
+                    const configUpdate = {
+                        client_content: {
+                            turns: [{
+                                role: "user",
+                                parts: [{ text: SYSTEM_INSTRUCTIONS }]
+                            }],
+                            turn_complete: true
+                        }
+                    };
+                    geminiWs.send(JSON.stringify(configUpdate));
+                }
+
                 if (response.serverContent?.modelTurn?.parts?.[0]?.inlineData) {
                     const audioBase64 = response.serverContent.modelTurn.parts[0].inlineData.data;
                     if (streamSid && ws.readyState === WebSocket.OPEN) {
@@ -86,16 +74,16 @@ wss.on('connection', (ws) => {
                     }
                 }
             } catch (err) {
-                console.error("Error processing Gemini message:", err);
+                console.error("Gemini Msg Error:", err);
             }
         });
 
         geminiWs.on('error', (error) => {
-            console.error('Gemini WebSocket Error:', error.message);
+            console.error('Gemini Error:', error.message);
         });
 
-        geminiWs.on('close', (code, reason) => {
-            console.log(`Gemini: Closed (Code: ${code})`);
+        geminiWs.on('close', (code) => {
+            console.log('Gemini Closed:', code);
         });
     };
 
@@ -106,9 +94,8 @@ wss.on('connection', (ws) => {
             const msg = JSON.parse(message);
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
-                console.log('Twilio: Stream started', streamSid);
+                console.log('Twilio Started:', streamSid);
             }
-            
             if (msg.event === 'media' && geminiWs?.readyState === WebSocket.OPEN) {
                 const audioMessage = {
                     realtime_input: {
@@ -121,16 +108,14 @@ wss.on('connection', (ws) => {
                 geminiWs.send(JSON.stringify(audioMessage));
             }
         } catch (err) {
-            console.error("Error processing Twilio message:", err);
+            console.error("Twilio Msg Error:", err);
         }
     });
 
     ws.on('close', () => {
-        console.log('Twilio: Connection closed');
-        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
-            geminiWs.close();
-        }
+        console.log('Twilio Closed');
+        if (geminiWs) geminiWs.close();
     });
 });
 
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Running on ${PORT}`));
