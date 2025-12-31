@@ -1,37 +1,31 @@
 // server.js
-// BluBinet Voice Bot – "נטע" (Gemini 2.0 Flash Realtime)
-// ✅ שימוש ב-v1beta למניעת שגיאת 404 בחשבונות Tier 1
-// ✅ תמיכה מלאה ב-ENV: MB_BOT_NAME, MB_BUSINESS_NAME, GEMINI_API_KEY
-// ✅ החלפה מלאה של OpenAI ו-ElevenLabs לחיבור אחד יציב
+// BluBinet Voice Bot – "נטע" (Gemini 2.5 Flash Native Audio)
+// ✅ שימוש במודל Gemini 2.5 החדש ביותר לביצועים מקסימליים
+// ✅ התאמה מלאה למפתח AI VOICE (Tier 1)
+// ✅ תמיכה ב-Thinking Mode וביכולות האודיו החדשות
 
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 
-// -----------------------------
-// Config & ENV
-// -----------------------------
-const PORT = process.env.PORT || 1000; // Render מצפה לפורט שהגדרת
+const PORT = process.env.PORT || 1000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
 const BOT_NAME = process.env.MB_BOT_NAME || 'נטע';
 const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || 'BluBinet';
-const VOICE_NAME = process.env.MB_VOICE_NAME || 'Aoede'; 
 
 const SYSTEM_INSTRUCTIONS = `
 את נציגה בשם "${BOT_NAME}" עבור "${BUSINESS_NAME}".
-חוקים קבועים:
-1) עני בעברית בלבד בצורה קצרה ואנושית (1-2 משפטים).
-2) אל תברכי שוב אחרי תחילת השיחה.
-3) אם הלקוח מבקש לסיים, עני בנימוס ונתקי.
+הנחיות קבועות:
+1) עני בעברית בלבד בצורה קצרה, אנושית ומקצועית.
+2) אל תחזרי על ברכות אם כבר בירכת בתחילת השיחה.
+3) אם הלקוח מעוניין לסיים, הודי לו בנימוס וסיימי את השיחה.
 ${process.env.MB_BUSINESS_PROMPT || ''}
 `.trim();
 
 const app = express();
-app.use(express.json());
-app.get('/', (req, res) => res.send('BluBinet Gemini Status: Online'));
+app.get('/', (req, res) => res.send('BluBinet Gemini 2.5 is Live'));
 
-// Twilio TwiML
 app.post('/twilio-voice', (req, res) => {
     const host = req.headers.host;
     res.type('text/xml').send(`
@@ -53,7 +47,7 @@ wss.on('connection', (ws) => {
     let geminiWs = null;
 
     const connectToGemini = () => {
-        // הכתובת המדויקת למניעת 404 בחשבונות Paid Tier 1
+        // שימוש ב-v1beta עבור יציבות מול מודל 2.5 החדש
         const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidirectionalGenerateContent?key=${GEMINI_API_KEY}`;
         
         geminiWs = new WebSocket(url);
@@ -61,13 +55,16 @@ wss.on('connection', (ws) => {
         geminiWs.on('open', () => {
             console.log('Gemini: WebSocket Connection Opened');
             
-            // הודעת SETUP - הגדרת מודל וקול
             const setup = {
                 setup: {
-                    model: "models/gemini-2.0-flash", // שם המודל ללא סיומת exp ליתר ביטחון ב-Tier 1
-                    generation_config: { response_modalities: ["audio"] },
+                    // שם המודל המדויק כפי שמופיע אצלך במסך ה-Playground
+                    model: "models/gemini-2.5-flash-native-audio-preview-12-2025",
+                    generation_config: { 
+                        response_modalities: ["audio"],
+                        thinking_config: { include_thoughts: true } 
+                    },
                     speech_config: {
-                        voice_config: { prebuilt_voice_config: { voice_name: VOICE_NAME } }
+                        voice_config: { prebuilt_voice_config: { voice_name: "Aoede" } }
                     },
                     system_instruction: { parts: [{ text: SYSTEM_INSTRUCTIONS }] }
                 }
@@ -79,12 +76,10 @@ wss.on('connection', (ws) => {
             try {
                 const response = JSON.parse(data);
 
-                // קבלת אישור שהחיבור עבר
                 if (response.setupComplete) {
-                    console.log('Gemini: Setup Verified! Connection is live.');
+                    console.log('Gemini: Setup Verified! Using Gemini 2.5 Flash Native Audio.');
                 }
 
-                // הזרמת אודיו חזרה לטוויליו
                 if (response.serverContent?.modelTurn?.parts?.[0]?.inlineData) {
                     const audioBase64 = response.serverContent.modelTurn.parts[0].inlineData.data;
                     if (streamSid && ws.readyState === WebSocket.OPEN) {
@@ -100,13 +95,8 @@ wss.on('connection', (ws) => {
             }
         });
 
-        geminiWs.on('error', (err) => {
-            console.error('Gemini Socket Error:', err.message);
-        });
-
-        geminiWs.on('close', (code, reason) => {
-            console.log(`Gemini Closed. Code: ${code}, Reason: ${reason}`);
-        });
+        geminiWs.on('error', (err) => console.error('Gemini Socket Error:', err.message));
+        geminiWs.on('close', (code, reason) => console.log(`Gemini Closed. Code: ${code}`));
     };
 
     connectToGemini();
@@ -118,7 +108,6 @@ wss.on('connection', (ws) => {
                 streamSid = msg.start.streamSid;
                 console.log('Twilio Stream Started:', streamSid);
             }
-            // הזרמת אודיו מטוויליו לג'מיני
             if (msg.event === 'media' && geminiWs?.readyState === WebSocket.OPEN) {
                 geminiWs.send(JSON.stringify({
                     realtime_input: {
@@ -133,7 +122,6 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
-        console.log('Twilio Connection Closed');
         if (geminiWs) geminiWs.close();
     });
 });
