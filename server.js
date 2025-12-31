@@ -1,8 +1,3 @@
-// server.js
-// BluBinet Voice Bot – "נטע"
-// ✅ שימוש בספרייה הרשמית @google/genai למניעת 404
-// ✅ מודל Gemini 2.5 Flash Native Audio
-
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -40,24 +35,30 @@ wss.on('connection', async (ws) => {
     let streamSid = null;
     let session = null;
 
-    // הגדרות המודל לפי הקוד שצירפת
+    // הגדרות המודל והקול לפי ה-SDK החדש
     const config = {
         model: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
-        systemInstruction: { parts: [{ text: `את נציגה בשם ${BOT_NAME} עבור ${BUSINESS_NAME}. עני בעברית קצרה.` }] },
-        generationConfig: { responseModalities: ['audio'] },
+        systemInstruction: { 
+            parts: [{ text: `את נציגה בשם ${BOT_NAME} עבור ${BUSINESS_NAME}. עני בעברית קצרה (1-2 משפטים).` }] 
+        },
+        generationConfig: { 
+            responseModalities: ['audio'] 
+        },
         speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Aoede' } }
+            voiceConfig: { 
+                prebuiltVoiceConfig: { voiceName: 'Aoede' } 
+            }
         }
     };
 
     try {
-        // התחברות באמצעות ה-SDK הרשמי
+        // התחברות באמצעות ה-SDK הרשמי שמנהל את ה-Websocket
         session = await genAI.live.connect({
             ...config,
             callbacks: {
-                onopen: () => console.log('Gemini SDK: Connected'),
+                onopen: () => console.log('Gemini SDK: Connected Successfully'),
                 onmessage: (message) => {
-                    // שליחת אודיו חזרה לטוויליו
+                    // הזרמת אודיו חזרה לטוויליו
                     if (message.serverContent?.modelTurn?.parts?.[0]?.inlineData) {
                         const audioData = message.serverContent.modelTurn.parts[0].inlineData.data;
                         if (streamSid && ws.readyState === WebSocket.OPEN) {
@@ -74,7 +75,7 @@ wss.on('connection', async (ws) => {
             }
         });
     } catch (err) {
-        console.error('Failed to connect to Gemini SDK:', err);
+        console.error('Critical: Failed to connect to Gemini SDK:', err);
     }
 
     ws.on('message', (message) => {
@@ -82,20 +83,17 @@ wss.on('connection', async (ws) => {
             const msg = JSON.parse(message);
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
-                console.log('Twilio Started:', streamSid);
+                console.log('Twilio Stream Started:', streamSid);
             }
             if (msg.event === 'media' && session) {
-                // שליחת אודיו ל-Gemini דרך ה-SDK
-                session.sendClientContent({
-                    turns: [{
-                        role: 'user',
-                        parts: [{
-                            inlineData: {
-                                data: msg.media.payload,
-                                mimeType: 'audio/mulaw'
-                            }
+                // שליחת אודיו מטוויליו לג'מיני דרך ה-SDK
+                session.send({
+                    realtimeInput: {
+                        mediaChunks: [{
+                            data: msg.media.payload,
+                            mimeType: 'audio/mulaw'
                         }]
-                    }]
+                    }
                 });
             }
         } catch (e) { }
@@ -103,8 +101,8 @@ wss.on('connection', async (ws) => {
 
     ws.on('close', () => {
         if (session) session.close();
-        console.log('Twilio Closed');
+        console.log('Twilio: Connection Closed');
     });
 });
 
-server.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
