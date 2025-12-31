@@ -5,7 +5,7 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const PORT = Number(process.env.PORT) || 3000;
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim(); // https://blubinet-realtime.onrender.com
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim();
 
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
 if (!GEMINI_API_KEY) {
@@ -17,10 +17,7 @@ const BOT_NAME = process.env.MB_BOT_NAME || "נטע";
 const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || "BluBinet";
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || process.env.MB_WEBHOOK_URL || "";
 
-// אם אתה רוצה לקבע מודל ספציפי ידנית אחרי שיש הרשאות:
-const FORCED_MODEL = (process.env.MB_GEMINI_MODEL || "").trim();
-
-// קול Gemini (רק עובד באמת כשיש מודל audio-bidi)
+const FORCED_MODEL = (process.env.MB_GEMINI_MODEL || "models/gemini-2.0-flash-exp").trim();
 const GEMINI_VOICE = process.env.MB_GEMINI_VOICE || "Aoede";
 
 const OPENING_TEXT =
@@ -45,58 +42,6 @@ app.use(express.urlencoded({ extended: true }));
 app.get("/", (req, res) => res.send("BluBinet Status: Online"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-/**
- * ===== Models discovery (REST) =====
- * We query: GET https://generativelanguage.googleapis.com/v1beta/models?key=...
- * Then filter models that support "bidiGenerateContent" in supportedGenerationMethods.
- */
-let cachedBidiModels = []; // ["models/xxx", ...]
-let lastModelsRefresh = 0;
-
-async function refreshModelsIfNeeded(force = false) {
-  const now = Date.now();
-  if (!force && now - lastModelsRefresh < 60_000) return; // 60s cache
-  lastModelsRefresh = now;
-
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-    const r = await fetch(url);
-    const j = await r.json().catch(() => ({}));
-
-    const models = Array.isArray(j.models) ? j.models : [];
-    const bidi = models
-      .filter((m) => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes("bidiGenerateContent"))
-      .map((m) => m.name)
-      .filter(Boolean);
-
-    cachedBidiModels = bidi;
-
-    console.log("==> Gemini models refreshed");
-    console.log("==> BidiGenerateContent supported models:", cachedBidiModels.length ? cachedBidiModels : "(none)");
-
-    // גם נדפיס “רמז” אם אין בכלל bidi
-    if (!cachedBidiModels.length) {
-      console.log("!! No bidiGenerateContent models available for this key/project.");
-      console.log("!! This strongly indicates Gemini Live access is NOT enabled yet (allowlist/preview).");
-    }
-  } catch (e) {
-    console.error("Failed to refresh models:", e?.message || e);
-  }
-}
-
-// Endpoint to view models list + bidi list
-app.get("/models", async (req, res) => {
-  await refreshModelsIfNeeded(true);
-  res.json({
-    forcedModel: FORCED_MODEL || null,
-    bidiModels: cachedBidiModels,
-    note: cachedBidiModels.length
-      ? "These models support bidiGenerateContent. Use one of them in MB_GEMINI_MODEL if you want to force."
-      : "No bidi models found. Likely Live access not enabled yet.",
-  });
-});
-
-// Twilio Voice webhook (TwiML -> Media Stream)
 function buildWsUrl(req) {
   if (PUBLIC_BASE_URL) {
     const u = new URL(PUBLIC_BASE_URL);
@@ -107,7 +52,7 @@ function buildWsUrl(req) {
   return `wss://${host}/twilio-media-stream`;
 }
 
-app.post("/twilio-voice", async (req, res) => {
+app.post("/twilio-voice", (req, res) => {
   const wsUrl = buildWsUrl(req);
 
   console.log("==> /twilio-voice HIT", {
@@ -130,11 +75,11 @@ app.post("/twilio-voice", async (req, res) => {
 const server = http.createServer(app);
 
 // =====================
-// μ-law helpers (Twilio media stream is μ-law 8k)
+// μ-law helpers (Twilio = μ-law 8k)
 // =====================
 function mulawDecodeSample(muLawByte) {
   let mu = (~muLawByte) & 0xff;
-  let sign = (mu & 0x80) ? -1 : 1;
+  let sign = mu & 0x80 ? -1 : 1;
   let exponent = (mu >> 4) & 0x07;
   let mantissa = mu & 0x0f;
   let magnitude = ((mantissa << 1) + 1) << (exponent + 2);
@@ -143,6 +88,7 @@ function mulawDecodeSample(muLawByte) {
   if (sample < -32768) sample = -32768;
   return sample;
 }
+
 function mulawEncodeSample(pcm16) {
   const BIAS = 33;
   let sign = 0;
@@ -153,6 +99,7 @@ function mulawEncodeSample(pcm16) {
     sample = -sample;
     if (sample > 32767) sample = 32767;
   }
+
   sample = sample + BIAS;
   if (sample > 0x7fff) sample = 0x7fff;
 
@@ -180,7 +127,7 @@ function mulawB64ToPcm16_8k(mulawB64) {
   return pcmBuf;
 }
 
-// Upsample PCM16 8k -> 16k
+// Upsample PCM16 8k -> 16k (linear interp)
 function upsamplePcm16_8k_to_16k(pcm8kBuf) {
   const inSamples = pcm8kBuf.length / 2;
   if (inSamples < 2) return pcm8kBuf;
@@ -205,18 +152,51 @@ function upsamplePcm16_8k_to_16k(pcm8kBuf) {
   return outBuf;
 }
 
-// Downsample PCM16 24k -> 8k (factor 3 avg)
-function downsamplePcm16_24k_to_8k(pcm24kBuf) {
-  const inSamples = pcm24kBuf.length / 2;
-  const outSamples = Math.floor(inSamples / 3);
-  if (outSamples <= 0) return Buffer.alloc(0);
+// --------- BETTER: Low-pass FIR then decimate 24k -> 8k ---------
+// Small FIR lowpass tuned for decimation by 3 (cutoff ~3.2kHz @24k)
+// Coeffs are symmetric; gain normalized.
+const FIR = [
+  -0.0042, -0.0101, -0.0146, -0.0107,
+   0.0060,  0.0331,  0.0640,  0.0895,
+   0.1010,
+   0.0895,  0.0640,  0.0331,  0.0060,
+  -0.0107, -0.0146, -0.0101, -0.0042
+];
+const FIR_HALF = Math.floor(FIR.length / 2);
 
+function clamp16(x) {
+  if (x > 32767) return 32767;
+  if (x < -32768) return -32768;
+  return x | 0;
+}
+
+function lowpassFIR24k(pcm24kBuf) {
+  const n = pcm24kBuf.length / 2;
+  const out = new Int16Array(n);
+
+  for (let i = 0; i < n; i++) {
+    let acc = 0;
+    for (let k = -FIR_HALF; k <= FIR_HALF; k++) {
+      const idx = i + k;
+      const s = idx < 0 || idx >= n ? 0 : pcm24kBuf.readInt16LE(idx * 2);
+      acc += s * FIR[k + FIR_HALF];
+    }
+    out[i] = clamp16(acc);
+  }
+  return Buffer.from(out.buffer);
+}
+
+function downsamplePcm16_24k_to_8k_clean(pcm24kBuf) {
+  if (!pcm24kBuf || pcm24kBuf.length < 6) return Buffer.alloc(0);
+
+  const filtered = lowpassFIR24k(pcm24kBuf);
+  const inSamples = filtered.length / 2;
+  const outSamples = Math.floor(inSamples / 3);
   const outBuf = Buffer.alloc(outSamples * 2);
+
   for (let i = 0; i < outSamples; i++) {
-    const a = pcm24kBuf.readInt16LE((i * 3 + 0) * 2);
-    const b = pcm24kBuf.readInt16LE((i * 3 + 1) * 2);
-    const c = pcm24kBuf.readInt16LE((i * 3 + 2) * 2);
-    outBuf.writeInt16LE(((a + b + c) / 3) | 0, i * 2);
+    // pick every 3rd sample after lowpass
+    outBuf.writeInt16LE(filtered.readInt16LE((i * 3) * 2), i * 2);
   }
   return outBuf;
 }
@@ -232,7 +212,7 @@ function pcm16_8k_to_mulawB64(pcm8kBuf) {
 }
 
 // =====================
-// Gemini Live (WebSocket v1beta bidiGenerateContent)
+// Gemini Live WS (v1beta bidiGenerateContent)
 // =====================
 function geminiWsUrl() {
   return (
@@ -248,7 +228,7 @@ function makeSetupMsg(modelName) {
       model: modelName,
       generationConfig: {
         responseModalities: ["AUDIO"],
-        maxOutputTokens: 140,
+        maxOutputTokens: 160,
         temperature: 0.3,
         speechConfig: {
           voiceConfig: {
@@ -257,18 +237,16 @@ function makeSetupMsg(modelName) {
         },
       },
       systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTIONS }] },
-      realtimeInputConfig: {
-        activityHandling: "NO_INTERRUPTION", // לא קוטע
-      },
-      inputAudioTranscription: {},   // ללוגים (כשתהיה תמיכה מלאה)
-      outputAudioTranscription: {},  // ללוגים
+      realtimeInputConfig: { activityHandling: "NO_INTERRUPTION" },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
     },
   };
 }
 
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
-wss.on("connection", async (twilioWs, req) => {
+wss.on("connection", (twilioWs, req) => {
   console.log("Twilio: WS Connected", {
     ip: req.socket?.remoteAddress,
     ua: req.headers["user-agent"],
@@ -276,30 +254,20 @@ wss.on("connection", async (twilioWs, req) => {
 
   let streamSid = null;
   let geminiWs = null;
-  let callLog = [];
+
   let openingSent = false;
+  let callLog = [];
 
-  await refreshModelsIfNeeded(true);
+  // reconnect control
+  let reconnecting = false;
+  let closedByUs = false;
 
-  // קובעים אילו מודלים לנסות:
-  // 1) אם יש FORCED_MODEL -> רק אותו
-  // 2) אחרת -> כל המודלים שתומכים bidiGenerateContent מהחשבון שלך
-  const modelsToTry = FORCED_MODEL ? [FORCED_MODEL] : [...cachedBidiModels];
-
-  if (!modelsToTry.length) {
-    console.log("!! No bidi models to try. Closing Twilio stream.");
-    try { twilioWs.close(); } catch {}
-    return;
-  }
-
-  let currentModelIndex = 0;
-
-  const connectGeminiWithModel = (modelName) => {
+  function connectGemini() {
     geminiWs = new WebSocket(geminiWsUrl());
 
     geminiWs.on("open", () => {
-      console.log("Gemini: Connection Opened. Trying model:", modelName);
-      geminiWs.send(JSON.stringify(makeSetupMsg(modelName)));
+      console.log("Gemini: Connection Opened. Using model:", FORCED_MODEL);
+      geminiWs.send(JSON.stringify(makeSetupMsg(FORCED_MODEL)));
     });
 
     geminiWs.on("message", (raw) => {
@@ -328,7 +296,7 @@ wss.on("connection", async (twilioWs, req) => {
         return;
       }
 
-      // transcripts (אם קיימים)
+      // transcripts for logs (אם קיימים)
       if (msg?.serverContent?.inputTranscription?.text) {
         callLog.push({ user_transcript: msg.serverContent.inputTranscription.text });
       }
@@ -336,7 +304,6 @@ wss.on("connection", async (twilioWs, req) => {
         callLog.push({ bot_transcript: msg.serverContent.outputTranscription.text });
       }
 
-      // audio chunks
       const parts = msg?.serverContent?.modelTurn?.parts;
       if (Array.isArray(parts)) {
         for (const p of parts) {
@@ -344,17 +311,20 @@ wss.on("connection", async (twilioWs, req) => {
             const mime = p.inlineData.mimeType || "";
             const pcmBuf = b64ToBuf(p.inlineData.data);
 
-            // לרוב Gemini מוציא PCM 24k -> להוריד ל-8k ואז μ-law
+            // Most likely 24k PCM -> clean downsample to 8k -> μ-law
             let pcm8k = pcmBuf;
+
             if (!mime.includes("rate=8000")) {
-              pcm8k = downsamplePcm16_24k_to_8k(pcmBuf);
+              pcm8k = downsamplePcm16_24k_to_8k_clean(pcmBuf);
             }
+
             const mulawB64 = pcm16_8k_to_mulawB64(pcm8k);
 
             if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
               twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: mulawB64 } }));
             }
           }
+
           if (typeof p?.text === "string" && p.text.trim()) {
             callLog.push({ bot_text: p.text.trim() });
           }
@@ -370,35 +340,43 @@ wss.on("connection", async (twilioWs, req) => {
       const reasonStr = reason?.toString?.() || "";
       console.log("Gemini Connection Closed", code, reasonStr);
 
-      // אם מודל לא נתמך ל-bidi -> ננסה הבא
-      const isModelNotSupported =
-        code === 1008 &&
-        (reasonStr.includes("not found") || reasonStr.includes("not supported") || reasonStr.includes("bidi"));
+      if (closedByUs) return;
 
-      if (isModelNotSupported) {
-        currentModelIndex += 1;
-        const nextModel = modelsToTry[currentModelIndex];
-        if (nextModel) {
-          console.log("Gemini: Switching model to:", nextModel);
-          try { connectGeminiWithModel(nextModel); } catch {}
-          return;
-        }
+      // אם סגירה "תקינה" (1000) — לא סוגרים את Twilio.
+      // במקום זה נתחבר מחדש אוטומטית כדי שהשיחה תמשיך.
+      if (code === 1000 && !reconnecting) {
+        reconnecting = true;
+        setTimeout(() => {
+          reconnecting = false;
+          if (twilioWs.readyState === WebSocket.OPEN) {
+            console.log("Gemini: Reconnecting after normal close (1000)...");
+            connectGemini();
+          }
+        }, 250);
+        return;
       }
 
-      // סגירה רגילה
-      try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close(); } catch {}
+      // אם שגיאה/סגירה אחרת — נסגור גם טוויליו
+      try {
+        if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
+      } catch {}
     });
 
-    geminiWs.on("error", (e) => console.error("Gemini Error:", e?.message || e));
-  };
+    geminiWs.on("error", (e) => {
+      console.error("Gemini Error:", e?.message || e);
+    });
+  }
 
-  // Start
-  connectGeminiWithModel(modelsToTry[currentModelIndex]);
+  connectGemini();
 
   // Twilio -> Gemini audio
   twilioWs.on("message", (message) => {
     let msg;
-    try { msg = JSON.parse(message); } catch { return; }
+    try {
+      msg = JSON.parse(message);
+    } catch {
+      return;
+    }
 
     if (msg.event === "start") {
       streamSid = msg?.start?.streamSid || null;
@@ -410,7 +388,7 @@ wss.on("connection", async (twilioWs, req) => {
       if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN) return;
       if (!msg?.media?.payload) return;
 
-      // μ-law 8k -> PCM16 8k -> 16k PCM ל-Gemini
+      // μ-law 8k -> PCM16 8k -> upsample 16k -> send
       const pcm8k = mulawB64ToPcm16_8k(msg.media.payload);
       const pcm16k = upsamplePcm16_8k_to_16k(pcm8k);
 
@@ -425,13 +403,19 @@ wss.on("connection", async (twilioWs, req) => {
     }
 
     if (msg.event === "stop") {
-      try { if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close(); } catch {}
+      try {
+        closedByUs = true;
+        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+      } catch {}
     }
   });
 
   twilioWs.on("close", () => {
     console.log("Twilio Closed");
-    try { if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close(); } catch {}
+    try {
+      closedByUs = true;
+      if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+    } catch {}
 
     if (MAKE_WEBHOOK_URL) {
       fetch(MAKE_WEBHOOK_URL, {
@@ -448,8 +432,7 @@ wss.on("connection", async (twilioWs, req) => {
 process.on("unhandledRejection", (err) => console.error("unhandledRejection", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException", err));
 
-server.listen(PORT, "0.0.0.0", async () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on port ${PORT}`);
-  await refreshModelsIfNeeded(true);
-  console.log(`Try: ${PUBLIC_BASE_URL ? PUBLIC_BASE_URL + "/models" : "set PUBLIC_BASE_URL then /models"}`);
+  console.log("Forced model:", FORCED_MODEL);
 });
