@@ -1,7 +1,7 @@
 {
   "name": "blubinet-realtime",
-  "version": "1.0.2",
-  "description": "BluBinet voice bot using Twilio Media Streams + Gemini Live (WebSocket v1beta)",
+  "version": "1.0.5",
+  "description": "BluBinet Realtime - Twilio Media Streams <-> Gemini Live (auto-discovery bidi models)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
