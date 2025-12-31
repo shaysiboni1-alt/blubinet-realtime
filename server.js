@@ -4,7 +4,7 @@ const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 1000;
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim();
 
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
@@ -13,12 +13,14 @@ if (!GEMINI_API_KEY) {
   process.exit(1);
 }
 
+const MB_DEBUG = String(process.env.MB_DEBUG || "").toLowerCase() === "true";
+
 const BOT_NAME = process.env.MB_BOT_NAME || "נטע";
 const BUSINESS_NAME = process.env.MB_BUSINESS_NAME || "BluBinet";
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || process.env.MB_WEBHOOK_URL || "";
 
-const FORCED_MODEL = (process.env.MB_GEMINI_MODEL || "models/gemini-2.0-flash-exp").trim();
-const GEMINI_VOICE = process.env.MB_GEMINI_VOICE || "Aoede";
+const GEMINI_MODEL = (process.env.MB_GEMINI_MODEL || "models/gemini-2.0-flash-exp").trim();
+const GEMINI_VOICE = (process.env.MB_GEMINI_VOICE || "Aoede").trim();
 
 const OPENING_TEXT =
   process.env.MB_OPENING_TEXT ||
@@ -54,13 +56,9 @@ function buildWsUrl(req) {
 
 app.post("/twilio-voice", (req, res) => {
   const wsUrl = buildWsUrl(req);
-
-  console.log("==> /twilio-voice HIT", {
-    from: req.body?.From,
-    to: req.body?.To,
-    wsUrl,
-  });
-
+  if (MB_DEBUG) {
+    console.log("==> /twilio-voice", { from: req.body?.From, to: req.body?.To, wsUrl });
+  }
   res.type("text/xml").send(
     `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -138,7 +136,6 @@ function upsamplePcm16_8k_to_16k(pcm8kBuf) {
   for (let i = 0; i < inSamples; i++) {
     const curr = pcm8kBuf.readInt16LE(i * 2);
     const outIndex = i * 2;
-
     outBuf.writeInt16LE(curr, outIndex * 2);
 
     if (i < inSamples - 1) {
@@ -152,51 +149,125 @@ function upsamplePcm16_8k_to_16k(pcm8kBuf) {
   return outBuf;
 }
 
-// --------- BETTER: Low-pass FIR then decimate 24k -> 8k ---------
-// Small FIR lowpass tuned for decimation by 3 (cutoff ~3.2kHz @24k)
-// Coeffs are symmetric; gain normalized.
-const FIR = [
-  -0.0042, -0.0101, -0.0146, -0.0107,
-   0.0060,  0.0331,  0.0640,  0.0895,
-   0.1010,
-   0.0895,  0.0640,  0.0331,  0.0060,
-  -0.0107, -0.0146, -0.0101, -0.0042
-];
-const FIR_HALF = Math.floor(FIR.length / 2);
-
+// --------- DSP helpers (reduce harsh noise before μ-law) ---------
 function clamp16(x) {
   if (x > 32767) return 32767;
   if (x < -32768) return -32768;
   return x | 0;
 }
 
-function lowpassFIR24k(pcm24kBuf) {
-  const n = pcm24kBuf.length / 2;
-  const out = new Int16Array(n);
+// simple high-pass (DC removal)
+function highpassInPlace(pcmBuf, a = 0.995) {
+  const n = pcmBuf.length / 2;
+  if (n < 2) return pcmBuf;
+  let prevX = pcmBuf.readInt16LE(0);
+  let prevY = 0;
+  for (let i = 1; i < n; i++) {
+    const x = pcmBuf.readInt16LE(i * 2);
+    const y = (x - prevX) + (a * prevY);
+    pcmBuf.writeInt16LE(clamp16(y), i * 2);
+    prevX = x;
+    prevY = y;
+  }
+  return pcmBuf;
+}
+
+// soft limiter + normalize to target peak
+function normalizeAndLimitInPlace(pcmBuf, targetPeak = 28000) {
+  const n = pcmBuf.length / 2;
+  if (n === 0) return pcmBuf;
+
+  let peak = 1;
+  for (let i = 0; i < n; i++) {
+    const s = Math.abs(pcmBuf.readInt16LE(i * 2));
+    if (s > peak) peak = s;
+  }
+
+  const gain = Math.min(1.8, targetPeak / peak);
 
   for (let i = 0; i < n; i++) {
+    let x = pcmBuf.readInt16LE(i * 2) * gain;
+    // soft clip
+    const limit = 30000;
+    if (x > limit) x = limit + (x - limit) * 0.15;
+    if (x < -limit) x = -limit + (x + limit) * 0.15;
+    pcmBuf.writeInt16LE(clamp16(x), i * 2);
+  }
+  return pcmBuf;
+}
+
+// FIR lowpass for decimation by 3 (24k -> 8k)
+const FIR3 = [
+  -0.0042, -0.0101, -0.0146, -0.0107,
+   0.0060,  0.0331,  0.0640,  0.0895,
+   0.1010,
+   0.0895,  0.0640,  0.0331,  0.0060,
+  -0.0107, -0.0146, -0.0101, -0.0042
+];
+const FIR3_HALF = Math.floor(FIR3.length / 2);
+
+// FIR lowpass for decimation by 2 (16k -> 8k)
+const FIR2 = [
+  -0.0089, -0.0127,  0.0000,  0.0365,
+   0.0903,  0.1542,  0.2000,  0.1542,
+   0.0903,  0.0365,  0.0000, -0.0127,
+  -0.0089
+];
+const FIR2_HALF = Math.floor(FIR2.length / 2);
+
+function lowpassFIR(pcmBuf, coeffs, half) {
+  const n = pcmBuf.length / 2;
+  const out = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
     let acc = 0;
-    for (let k = -FIR_HALF; k <= FIR_HALF; k++) {
+    for (let k = -half; k <= half; k++) {
       const idx = i + k;
-      const s = idx < 0 || idx >= n ? 0 : pcm24kBuf.readInt16LE(idx * 2);
-      acc += s * FIR[k + FIR_HALF];
+      const s = idx < 0 || idx >= n ? 0 : pcmBuf.readInt16LE(idx * 2);
+      acc += s * coeffs[k + half];
     }
     out[i] = clamp16(acc);
   }
   return Buffer.from(out.buffer);
 }
 
-function downsamplePcm16_24k_to_8k_clean(pcm24kBuf) {
-  if (!pcm24kBuf || pcm24kBuf.length < 6) return Buffer.alloc(0);
+function downsampleTo8k(pcmBuf, inRate) {
+  if (inRate === 8000) return pcmBuf;
 
-  const filtered = lowpassFIR24k(pcm24kBuf);
-  const inSamples = filtered.length / 2;
-  const outSamples = Math.floor(inSamples / 3);
+  if (inRate === 24000) {
+    const filtered = lowpassFIR(pcmBuf, FIR3, FIR3_HALF);
+    const inSamples = filtered.length / 2;
+    const outSamples = Math.floor(inSamples / 3);
+    const outBuf = Buffer.alloc(outSamples * 2);
+    for (let i = 0; i < outSamples; i++) {
+      outBuf.writeInt16LE(filtered.readInt16LE((i * 3) * 2), i * 2);
+    }
+    return outBuf;
+  }
+
+  if (inRate === 16000) {
+    const filtered = lowpassFIR(pcmBuf, FIR2, FIR2_HALF);
+    const inSamples = filtered.length / 2;
+    const outSamples = Math.floor(inSamples / 2);
+    const outBuf = Buffer.alloc(outSamples * 2);
+    for (let i = 0; i < outSamples; i++) {
+      outBuf.writeInt16LE(filtered.readInt16LE((i * 2) * 2), i * 2);
+    }
+    return outBuf;
+  }
+
+  // fallback: linear resample to 8k (not perfect, but avoids brutal distortion)
+  const inSamples = pcmBuf.length / 2;
+  const outSamples = Math.max(1, Math.floor((inSamples * 8000) / inRate));
   const outBuf = Buffer.alloc(outSamples * 2);
-
   for (let i = 0; i < outSamples; i++) {
-    // pick every 3rd sample after lowpass
-    outBuf.writeInt16LE(filtered.readInt16LE((i * 3) * 2), i * 2);
+    const t = (i * (inSamples - 1)) / (outSamples - 1);
+    const i0 = Math.floor(t);
+    const i1 = Math.min(inSamples - 1, i0 + 1);
+    const frac = t - i0;
+    const s0 = pcmBuf.readInt16LE(i0 * 2);
+    const s1 = pcmBuf.readInt16LE(i1 * 2);
+    const s = s0 + (s1 - s0) * frac;
+    outBuf.writeInt16LE(clamp16(s), i * 2);
   }
   return outBuf;
 }
@@ -211,6 +282,13 @@ function pcm16_8k_to_mulawB64(pcm8kBuf) {
   return bufToB64(muBuf);
 }
 
+function parseRateFromMime(mimeType) {
+  if (!mimeType) return null;
+  const m = String(mimeType).match(/rate\s*=\s*(\d+)/i);
+  if (m) return Number(m[1]);
+  return null;
+}
+
 // =====================
 // Gemini Live WS (v1beta bidiGenerateContent)
 // =====================
@@ -222,10 +300,10 @@ function geminiWsUrl() {
   );
 }
 
-function makeSetupMsg(modelName) {
+function makeSetupMsg() {
   return {
     setup: {
-      model: modelName,
+      model: GEMINI_MODEL,
       generationConfig: {
         responseModalities: ["AUDIO"],
         maxOutputTokens: 160,
@@ -253,21 +331,55 @@ wss.on("connection", (twilioWs, req) => {
   });
 
   let streamSid = null;
+  let twilioReady = false;
+
   let geminiWs = null;
+  let geminiReady = false;
 
   let openingSent = false;
-  let callLog = [];
 
-  // reconnect control
-  let reconnecting = false;
+  let callLog = [];
+  const pushLog = (obj) => {
+    callLog.push({ ts: new Date().toISOString(), ...obj });
+    if (MB_DEBUG) console.log("LOG+", obj);
+  };
+
+  let reconnectTimer = null;
   let closedByUs = false;
 
+  function maybeSendOpening() {
+    if (openingSent) return;
+    if (!twilioReady || !geminiReady) return;
+
+    openingSent = true;
+    pushLog({ type: "opening", text: OPENING_TEXT });
+
+    geminiWs.send(
+      JSON.stringify({
+        clientContent: {
+          turns: [{ role: "user", parts: [{ text: OPENING_TEXT }] }],
+          turnComplete: true,
+        },
+      })
+    );
+  }
+
   function connectGemini() {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    geminiReady = false;
+
     geminiWs = new WebSocket(geminiWsUrl());
 
+    // keepalive ping
+    const pingInterval = setInterval(() => {
+      try {
+        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.ping();
+      } catch {}
+    }, 20000);
+
     geminiWs.on("open", () => {
-      console.log("Gemini: Connection Opened. Using model:", FORCED_MODEL);
-      geminiWs.send(JSON.stringify(makeSetupMsg(FORCED_MODEL)));
+      console.log("Gemini: Connection Opened. Using model:", GEMINI_MODEL);
+      geminiWs.send(JSON.stringify(makeSetupMsg()));
     });
 
     geminiWs.on("message", (raw) => {
@@ -280,43 +392,44 @@ wss.on("connection", (twilioWs, req) => {
 
       if (msg.setupComplete) {
         console.log("Gemini: Setup Complete (model ok)");
-
-        // פתיח מיידי
-        if (!openingSent) {
-          openingSent = true;
-          geminiWs.send(
-            JSON.stringify({
-              clientContent: {
-                turns: [{ role: "user", parts: [{ text: OPENING_TEXT }] }],
-                turnComplete: true,
-              },
-            })
-          );
-        }
+        geminiReady = true;
+        pushLog({ type: "setup_complete", model: GEMINI_MODEL, voice: GEMINI_VOICE });
+        maybeSendOpening();
         return;
       }
 
-      // transcripts for logs (אם קיימים)
+      // IMPORTANT: transcriptions live under serverContent.* (sent independently, no guaranteed ordering) :contentReference[oaicite:1]{index=1}
       if (msg?.serverContent?.inputTranscription?.text) {
-        callLog.push({ user_transcript: msg.serverContent.inputTranscription.text });
+        pushLog({ type: "user_transcript", text: msg.serverContent.inputTranscription.text });
       }
       if (msg?.serverContent?.outputTranscription?.text) {
-        callLog.push({ bot_transcript: msg.serverContent.outputTranscription.text });
+        pushLog({ type: "bot_transcript", text: msg.serverContent.outputTranscription.text });
       }
 
-      const parts = msg?.serverContent?.modelTurn?.parts;
+      const sc = msg?.serverContent;
+      const parts = sc?.modelTurn?.parts;
+
       if (Array.isArray(parts)) {
         for (const p of parts) {
+          if (typeof p?.text === "string" && p.text.trim()) {
+            pushLog({ type: "bot_text", text: p.text.trim() });
+          }
+
           if (p?.inlineData?.data) {
             const mime = p.inlineData.mimeType || "";
-            const pcmBuf = b64ToBuf(p.inlineData.data);
+            const inRate = parseRateFromMime(mime) || 24000; // default guess if mime missing
+            const pcmIn = b64ToBuf(p.inlineData.data);
 
-            // Most likely 24k PCM -> clean downsample to 8k -> μ-law
-            let pcm8k = pcmBuf;
-
-            if (!mime.includes("rate=8000")) {
-              pcm8k = downsamplePcm16_24k_to_8k_clean(pcmBuf);
+            if (MB_DEBUG) {
+              console.log("Gemini audio chunk", { mime, inRate, bytes: pcmIn.length });
             }
+
+            // convert to PCM16 8k clean
+            let pcm8k = downsampleTo8k(pcmIn, inRate);
+
+            // mild cleanup before μ-law
+            pcm8k = highpassInPlace(pcm8k);
+            pcm8k = normalizeAndLimitInPlace(pcm8k);
 
             const mulawB64 = pcm16_8k_to_mulawB64(pcm8k);
 
@@ -324,46 +437,37 @@ wss.on("connection", (twilioWs, req) => {
               twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: mulawB64 } }));
             }
           }
-
-          if (typeof p?.text === "string" && p.text.trim()) {
-            callLog.push({ bot_text: p.text.trim() });
-          }
         }
       }
 
       if (msg?.error?.message) {
         console.error("Gemini Server Error:", msg.error.message);
+        pushLog({ type: "gemini_error", message: msg.error.message });
       }
     });
 
     geminiWs.on("close", (code, reason) => {
+      clearInterval(pingInterval);
       const reasonStr = reason?.toString?.() || "";
       console.log("Gemini Connection Closed", code, reasonStr);
+      pushLog({ type: "gemini_close", code, reason: reasonStr });
 
       if (closedByUs) return;
 
-      // אם סגירה "תקינה" (1000) — לא סוגרים את Twilio.
-      // במקום זה נתחבר מחדש אוטומטית כדי שהשיחה תמשיך.
-      if (code === 1000 && !reconnecting) {
-        reconnecting = true;
-        setTimeout(() => {
-          reconnecting = false;
-          if (twilioWs.readyState === WebSocket.OPEN) {
-            console.log("Gemini: Reconnecting after normal close (1000)...");
-            connectGemini();
-          }
-        }, 250);
-        return;
-      }
-
-      // אם שגיאה/סגירה אחרת — נסגור גם טוויליו
-      try {
-        if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close();
-      } catch {}
+      // NEVER close Twilio because Gemini closed.
+      // Auto-reconnect Gemini so the call can continue.
+      reconnectTimer = setTimeout(() => {
+        if (twilioWs.readyState === WebSocket.OPEN) {
+          console.log("Gemini: Reconnecting...");
+          connectGemini();
+          // do NOT re-send opening if already sent
+        }
+      }, 250);
     });
 
     geminiWs.on("error", (e) => {
       console.error("Gemini Error:", e?.message || e);
+      pushLog({ type: "gemini_ws_error", message: e?.message || String(e) });
     });
   }
 
@@ -380,7 +484,10 @@ wss.on("connection", (twilioWs, req) => {
 
     if (msg.event === "start") {
       streamSid = msg?.start?.streamSid || null;
+      twilioReady = true;
       console.log("Twilio Started:", streamSid);
+      pushLog({ type: "twilio_start", streamSid });
+      maybeSendOpening();
       return;
     }
 
@@ -388,7 +495,7 @@ wss.on("connection", (twilioWs, req) => {
       if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN) return;
       if (!msg?.media?.payload) return;
 
-      // μ-law 8k -> PCM16 8k -> upsample 16k -> send
+      // μ-law 8k -> PCM16 8k -> upsample 16k -> send to Gemini
       const pcm8k = mulawB64ToPcm16_8k(msg.media.payload);
       const pcm16k = upsamplePcm16_8k_to_16k(pcm8k);
 
@@ -403,6 +510,7 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     if (msg.event === "stop") {
+      pushLog({ type: "twilio_stop" });
       try {
         closedByUs = true;
         if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
@@ -412,8 +520,11 @@ wss.on("connection", (twilioWs, req) => {
 
   twilioWs.on("close", () => {
     console.log("Twilio Closed");
+    pushLog({ type: "twilio_close" });
+
     try {
       closedByUs = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
     } catch {}
 
@@ -434,5 +545,5 @@ process.on("uncaughtException", (err) => console.error("uncaughtException", err)
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on port ${PORT}`);
-  console.log("Forced model:", FORCED_MODEL);
+  console.log("Model:", GEMINI_MODEL, "Voice:", GEMINI_VOICE);
 });
