@@ -56,9 +56,8 @@ function buildWsUrl(req) {
 
 app.post("/twilio-voice", (req, res) => {
   const wsUrl = buildWsUrl(req);
-  if (MB_DEBUG) {
-    console.log("==> /twilio-voice", { from: req.body?.From, to: req.body?.To, wsUrl });
-  }
+  if (MB_DEBUG) console.log("==> /twilio-voice", { from: req.body?.From, to: req.body?.To, wsUrl });
+
   res.type("text/xml").send(
     `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -71,6 +70,49 @@ app.post("/twilio-voice", (req, res) => {
 });
 
 const server = http.createServer(app);
+
+// =====================
+// Base64 helpers
+// =====================
+const b64ToBuf = (b64) => Buffer.from(b64, "base64");
+const bufToB64 = (buf) => Buffer.from(buf).toString("base64");
+
+// Detect if a buffer is mostly ASCII base64 text (heuristic)
+function looksLikeBase64Text(buf) {
+  if (!buf || buf.length < 64) return false;
+  let good = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const c = buf[i];
+    const isB64 =
+      (c >= 0x41 && c <= 0x5a) || // A-Z
+      (c >= 0x61 && c <= 0x7a) || // a-z
+      (c >= 0x30 && c <= 0x39) || // 0-9
+      c === 0x2b || // +
+      c === 0x2f || // /
+      c === 0x3d || // =
+      c === 0x0a || // \n
+      c === 0x0d;   // \r
+    if (isB64) good++;
+  }
+  return good / buf.length > 0.92;
+}
+
+// Sometimes audio payload is "double base64" – this fixes it automatically
+function decodeMaybeDoubleBase64(b64) {
+  const first = b64ToBuf(b64);
+  if (looksLikeBase64Text(first)) {
+    try {
+      const asText = first.toString("utf8").replace(/\s+/g, "");
+      // base64 strings usually multiple of 4
+      if (asText.length % 4 === 0) {
+        const second = b64ToBuf(asText);
+        // sanity: pcm should be even length
+        if (second.length >= 200 && second.length % 2 === 0) return second;
+      }
+    } catch {}
+  }
+  return first;
+}
 
 // =====================
 // μ-law helpers (Twilio = μ-law 8k)
@@ -112,10 +154,6 @@ function mulawEncodeSample(pcm16) {
   return (~(sign | (exponent << 4) | mantissa)) & 0xff;
 }
 
-const b64ToBuf = (b64) => Buffer.from(b64, "base64");
-const bufToB64 = (buf) => Buffer.from(buf).toString("base64");
-
-// Twilio μ-law b64 -> PCM16 8k
 function mulawB64ToPcm16_8k(mulawB64) {
   const muBuf = b64ToBuf(mulawB64);
   const pcmBuf = Buffer.alloc(muBuf.length * 2);
@@ -149,14 +187,13 @@ function upsamplePcm16_8k_to_16k(pcm8kBuf) {
   return outBuf;
 }
 
-// --------- DSP helpers (reduce harsh noise before μ-law) ---------
 function clamp16(x) {
   if (x > 32767) return 32767;
   if (x < -32768) return -32768;
   return x | 0;
 }
 
-// simple high-pass (DC removal)
+// Mild DC removal + limiter to reduce harsh μ-law artifacts
 function highpassInPlace(pcmBuf, a = 0.995) {
   const n = pcmBuf.length / 2;
   if (n < 2) return pcmBuf;
@@ -172,52 +209,37 @@ function highpassInPlace(pcmBuf, a = 0.995) {
   return pcmBuf;
 }
 
-// soft limiter + normalize to target peak
-function normalizeAndLimitInPlace(pcmBuf, targetPeak = 28000) {
+function normalizeAndLimitInPlace(pcmBuf, targetPeak = 26000) {
   const n = pcmBuf.length / 2;
-  if (n === 0) return pcmBuf;
+  if (!n) return pcmBuf;
 
   let peak = 1;
   for (let i = 0; i < n; i++) {
     const s = Math.abs(pcmBuf.readInt16LE(i * 2));
     if (s > peak) peak = s;
   }
+  const gain = Math.min(1.6, targetPeak / peak);
 
-  const gain = Math.min(1.8, targetPeak / peak);
-
+  const hard = 29000;
   for (let i = 0; i < n; i++) {
     let x = pcmBuf.readInt16LE(i * 2) * gain;
     // soft clip
-    const limit = 30000;
-    if (x > limit) x = limit + (x - limit) * 0.15;
-    if (x < -limit) x = -limit + (x + limit) * 0.15;
+    if (x > hard) x = hard + (x - hard) * 0.12;
+    if (x < -hard) x = -hard + (x + hard) * 0.12;
     pcmBuf.writeInt16LE(clamp16(x), i * 2);
   }
   return pcmBuf;
 }
 
-// FIR lowpass for decimation by 3 (24k -> 8k)
-const FIR3 = [
-  -0.0042, -0.0101, -0.0146, -0.0107,
-   0.0060,  0.0331,  0.0640,  0.0895,
-   0.1010,
-   0.0895,  0.0640,  0.0331,  0.0060,
-  -0.0107, -0.0146, -0.0101, -0.0042
-];
-const FIR3_HALF = Math.floor(FIR3.length / 2);
+// FIR lowpass decimators (24k->8k, 16k->8k)
+const FIR3 = [-0.0042,-0.0101,-0.0146,-0.0107,0.0060,0.0331,0.0640,0.0895,0.1010,0.0895,0.0640,0.0331,0.0060,-0.0107,-0.0146,-0.0101,-0.0042];
+const FIR2 = [-0.0089,-0.0127,0.0000,0.0365,0.0903,0.1542,0.2000,0.1542,0.0903,0.0365,0.0000,-0.0127,-0.0089];
 
-// FIR lowpass for decimation by 2 (16k -> 8k)
-const FIR2 = [
-  -0.0089, -0.0127,  0.0000,  0.0365,
-   0.0903,  0.1542,  0.2000,  0.1542,
-   0.0903,  0.0365,  0.0000, -0.0127,
-  -0.0089
-];
-const FIR2_HALF = Math.floor(FIR2.length / 2);
-
-function lowpassFIR(pcmBuf, coeffs, half) {
+function lowpassFIR(pcmBuf, coeffs) {
+  const half = Math.floor(coeffs.length / 2);
   const n = pcmBuf.length / 2;
   const out = new Int16Array(n);
+
   for (let i = 0; i < n; i++) {
     let acc = 0;
     for (let k = -half; k <= half; k++) {
@@ -234,7 +256,7 @@ function downsampleTo8k(pcmBuf, inRate) {
   if (inRate === 8000) return pcmBuf;
 
   if (inRate === 24000) {
-    const filtered = lowpassFIR(pcmBuf, FIR3, FIR3_HALF);
+    const filtered = lowpassFIR(pcmBuf, FIR3);
     const inSamples = filtered.length / 2;
     const outSamples = Math.floor(inSamples / 3);
     const outBuf = Buffer.alloc(outSamples * 2);
@@ -245,7 +267,7 @@ function downsampleTo8k(pcmBuf, inRate) {
   }
 
   if (inRate === 16000) {
-    const filtered = lowpassFIR(pcmBuf, FIR2, FIR2_HALF);
+    const filtered = lowpassFIR(pcmBuf, FIR2);
     const inSamples = filtered.length / 2;
     const outSamples = Math.floor(inSamples / 2);
     const outBuf = Buffer.alloc(outSamples * 2);
@@ -255,24 +277,22 @@ function downsampleTo8k(pcmBuf, inRate) {
     return outBuf;
   }
 
-  // fallback: linear resample to 8k (not perfect, but avoids brutal distortion)
+  // fallback linear
   const inSamples = pcmBuf.length / 2;
   const outSamples = Math.max(1, Math.floor((inSamples * 8000) / inRate));
   const outBuf = Buffer.alloc(outSamples * 2);
   for (let i = 0; i < outSamples; i++) {
-    const t = (i * (inSamples - 1)) / (outSamples - 1);
+    const t = (i * (inSamples - 1)) / Math.max(1, (outSamples - 1));
     const i0 = Math.floor(t);
     const i1 = Math.min(inSamples - 1, i0 + 1);
     const frac = t - i0;
     const s0 = pcmBuf.readInt16LE(i0 * 2);
     const s1 = pcmBuf.readInt16LE(i1 * 2);
-    const s = s0 + (s1 - s0) * frac;
-    outBuf.writeInt16LE(clamp16(s), i * 2);
+    outBuf.writeInt16LE(clamp16(s0 + (s1 - s0) * frac), i * 2);
   }
   return outBuf;
 }
 
-// PCM16 8k -> μ-law b64
 function pcm16_8k_to_mulawB64(pcm8kBuf) {
   const inSamples = pcm8kBuf.length / 2;
   const muBuf = Buffer.alloc(inSamples);
@@ -300,35 +320,37 @@ function geminiWsUrl() {
   );
 }
 
+// IMPORTANT: transcription flags are snake_case in setup :contentReference[oaicite:2]{index=2}
 function makeSetupMsg() {
-  return {
+  const setup = {
     setup: {
       model: GEMINI_MODEL,
-      generationConfig: {
-        responseModalities: ["AUDIO"],
-        maxOutputTokens: 160,
+      generation_config: {
+        response_modalities: ["AUDIO"],
+        max_output_tokens: 160,
         temperature: 0.3,
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: GEMINI_VOICE },
+        speech_config: {
+          voice_config: {
+            prebuilt_voice_config: { voice_name: GEMINI_VOICE },
           },
         },
       },
-      systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTIONS }] },
-      realtimeInputConfig: { activityHandling: "NO_INTERRUPTION" },
-      inputAudioTranscription: {},
-      outputAudioTranscription: {},
+      system_instruction: { parts: [{ text: SYSTEM_INSTRUCTIONS }] },
+
+      realtime_input_config: { activity_handling: "NO_INTERRUPTION" },
+
+      // enable transcriptions
+      input_audio_transcription: {},
+      output_audio_transcription: {},
     },
   };
+  return setup;
 }
 
 const wss = new WebSocket.Server({ server, path: "/twilio-media-stream" });
 
 wss.on("connection", (twilioWs, req) => {
-  console.log("Twilio: WS Connected", {
-    ip: req.socket?.remoteAddress,
-    ua: req.headers["user-agent"],
-  });
+  console.log("Twilio: WS Connected", { ip: req.socket?.remoteAddress, ua: req.headers["user-agent"] });
 
   let streamSid = null;
   let twilioReady = false;
@@ -337,28 +359,27 @@ wss.on("connection", (twilioWs, req) => {
   let geminiReady = false;
 
   let openingSent = false;
+  let closedByUs = false;
+  let reconnectTimer = null;
 
-  let callLog = [];
-  const pushLog = (obj) => {
+  const callLog = [];
+  const log = (obj) => {
     callLog.push({ ts: new Date().toISOString(), ...obj });
     if (MB_DEBUG) console.log("LOG+", obj);
   };
-
-  let reconnectTimer = null;
-  let closedByUs = false;
 
   function maybeSendOpening() {
     if (openingSent) return;
     if (!twilioReady || !geminiReady) return;
 
     openingSent = true;
-    pushLog({ type: "opening", text: OPENING_TEXT });
+    log({ type: "opening", text: OPENING_TEXT });
 
     geminiWs.send(
       JSON.stringify({
-        clientContent: {
+        client_content: {
           turns: [{ role: "user", parts: [{ text: OPENING_TEXT }] }],
-          turnComplete: true,
+          turn_complete: true,
         },
       })
     );
@@ -370,15 +391,8 @@ wss.on("connection", (twilioWs, req) => {
 
     geminiWs = new WebSocket(geminiWsUrl());
 
-    // keepalive ping
-    const pingInterval = setInterval(() => {
-      try {
-        if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.ping();
-      } catch {}
-    }, 20000);
-
     geminiWs.on("open", () => {
-      console.log("Gemini: Connection Opened. Using model:", GEMINI_MODEL);
+      console.log("Gemini: Connection Opened. Model:", GEMINI_MODEL, "Voice:", GEMINI_VOICE);
       geminiWs.send(JSON.stringify(makeSetupMsg()));
     });
 
@@ -390,44 +404,44 @@ wss.on("connection", (twilioWs, req) => {
         return;
       }
 
-      if (msg.setupComplete) {
-        console.log("Gemini: Setup Complete (model ok)");
+      if (msg.setupComplete || msg.setup_complete) {
+        console.log("Gemini: Setup Complete");
         geminiReady = true;
-        pushLog({ type: "setup_complete", model: GEMINI_MODEL, voice: GEMINI_VOICE });
+        log({ type: "setup_complete", model: GEMINI_MODEL, voice: GEMINI_VOICE });
         maybeSendOpening();
         return;
       }
 
-      // IMPORTANT: transcriptions live under serverContent.* (sent independently, no guaranteed ordering) :contentReference[oaicite:1]{index=1}
-      if (msg?.serverContent?.inputTranscription?.text) {
-        pushLog({ type: "user_transcript", text: msg.serverContent.inputTranscription.text });
+      // Transcriptions (if enabled)
+      const sc = msg.serverContent || msg.server_content;
+      if (sc?.inputTranscription?.text || sc?.input_transcription?.text) {
+        log({ type: "user_transcript", text: (sc.inputTranscription?.text || sc.input_transcription?.text || "").trim() });
       }
-      if (msg?.serverContent?.outputTranscription?.text) {
-        pushLog({ type: "bot_transcript", text: msg.serverContent.outputTranscription.text });
+      if (sc?.outputTranscription?.text || sc?.output_transcription?.text) {
+        log({ type: "bot_transcript", text: (sc.outputTranscription?.text || sc.output_transcription?.text || "").trim() });
       }
 
-      const sc = msg?.serverContent;
-      const parts = sc?.modelTurn?.parts;
-
+      const modelTurn = sc?.modelTurn || sc?.model_turn;
+      const parts = modelTurn?.parts;
       if (Array.isArray(parts)) {
         for (const p of parts) {
+          // text parts
           if (typeof p?.text === "string" && p.text.trim()) {
-            pushLog({ type: "bot_text", text: p.text.trim() });
+            log({ type: "bot_text", text: p.text.trim() });
           }
 
-          if (p?.inlineData?.data) {
-            const mime = p.inlineData.mimeType || "";
-            const inRate = parseRateFromMime(mime) || 24000; // default guess if mime missing
-            const pcmIn = b64ToBuf(p.inlineData.data);
+          // audio parts
+          const inline = p?.inlineData || p?.inline_data;
+          if (inline?.data) {
+            const mime = inline.mimeType || inline.mime_type || "";
+            const inRate = parseRateFromMime(mime) || 24000;
 
-            if (MB_DEBUG) {
-              console.log("Gemini audio chunk", { mime, inRate, bytes: pcmIn.length });
-            }
+            // Fix possible double-base64
+            const pcmIn = decodeMaybeDoubleBase64(inline.data);
 
-            // convert to PCM16 8k clean
+            if (MB_DEBUG) console.log("Gemini audio chunk", { mime, inRate, bytes: pcmIn.length });
+
             let pcm8k = downsampleTo8k(pcmIn, inRate);
-
-            // mild cleanup before μ-law
             pcm8k = highpassInPlace(pcm8k);
             pcm8k = normalizeAndLimitInPlace(pcm8k);
 
@@ -440,40 +454,37 @@ wss.on("connection", (twilioWs, req) => {
         }
       }
 
-      if (msg?.error?.message) {
-        console.error("Gemini Server Error:", msg.error.message);
-        pushLog({ type: "gemini_error", message: msg.error.message });
+      const err = msg?.error?.message;
+      if (err) {
+        console.error("Gemini error:", err);
+        log({ type: "gemini_error", message: err });
       }
     });
 
     geminiWs.on("close", (code, reason) => {
-      clearInterval(pingInterval);
       const reasonStr = reason?.toString?.() || "";
       console.log("Gemini Connection Closed", code, reasonStr);
-      pushLog({ type: "gemini_close", code, reason: reasonStr });
+      log({ type: "gemini_close", code, reason: reasonStr });
 
       if (closedByUs) return;
 
-      // NEVER close Twilio because Gemini closed.
-      // Auto-reconnect Gemini so the call can continue.
+      // Do NOT close Twilio because Gemini closed. Reconnect.
       reconnectTimer = setTimeout(() => {
         if (twilioWs.readyState === WebSocket.OPEN) {
           console.log("Gemini: Reconnecting...");
           connectGemini();
-          // do NOT re-send opening if already sent
         }
       }, 250);
     });
 
     geminiWs.on("error", (e) => {
-      console.error("Gemini Error:", e?.message || e);
-      pushLog({ type: "gemini_ws_error", message: e?.message || String(e) });
+      console.error("Gemini WS error:", e?.message || e);
+      log({ type: "gemini_ws_error", message: e?.message || String(e) });
     });
   }
 
   connectGemini();
 
-  // Twilio -> Gemini audio
   twilioWs.on("message", (message) => {
     let msg;
     try {
@@ -486,7 +497,7 @@ wss.on("connection", (twilioWs, req) => {
       streamSid = msg?.start?.streamSid || null;
       twilioReady = true;
       console.log("Twilio Started:", streamSid);
-      pushLog({ type: "twilio_start", streamSid });
+      log({ type: "twilio_start", streamSid });
       maybeSendOpening();
       return;
     }
@@ -495,14 +506,13 @@ wss.on("connection", (twilioWs, req) => {
       if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN) return;
       if (!msg?.media?.payload) return;
 
-      // μ-law 8k -> PCM16 8k -> upsample 16k -> send to Gemini
       const pcm8k = mulawB64ToPcm16_8k(msg.media.payload);
       const pcm16k = upsamplePcm16_8k_to_16k(pcm8k);
 
       geminiWs.send(
         JSON.stringify({
-          realtimeInput: {
-            audio: { mimeType: "audio/pcm;rate=16000", data: bufToB64(pcm16k) },
+          realtime_input: {
+            audio: { mime_type: "audio/pcm;rate=16000", data: bufToB64(pcm16k) },
           },
         })
       );
@@ -510,7 +520,7 @@ wss.on("connection", (twilioWs, req) => {
     }
 
     if (msg.event === "stop") {
-      pushLog({ type: "twilio_stop" });
+      log({ type: "twilio_stop" });
       try {
         closedByUs = true;
         if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
@@ -520,7 +530,7 @@ wss.on("connection", (twilioWs, req) => {
 
   twilioWs.on("close", () => {
     console.log("Twilio Closed");
-    pushLog({ type: "twilio_close" });
+    log({ type: "twilio_close" });
 
     try {
       closedByUs = true;
@@ -537,7 +547,7 @@ wss.on("connection", (twilioWs, req) => {
     }
   });
 
-  twilioWs.on("error", (e) => console.error("Twilio WS Error:", e?.message || e));
+  twilioWs.on("error", (e) => console.error("Twilio WS error:", e?.message || e));
 });
 
 process.on("unhandledRejection", (err) => console.error("unhandledRejection", err));
