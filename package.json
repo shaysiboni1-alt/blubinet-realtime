@@ -1,12 +1,13 @@
 {
   "name": "blubinet-realtime",
   "version": "1.0.0",
-  "description": "BluBinet realtime voice bot using Twilio Media Streams + OpenAI Realtime API",
+  "description": "BluBinet realtime voice bot using Twilio Media Streams + Gemini Multimodal Live API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.21.0",
     "express": "^4.19.2",
     "ws": "^8.18.0",
     "dotenv": "^16.4.5"
