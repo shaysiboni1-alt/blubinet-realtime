@@ -7,7 +7,6 @@ const { logger } = require("../utils/logger");
 const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
 
 function normalizeModelName(m) {
-  // Google expects: "models/<model>"
   if (!m) return "";
   if (m.startsWith("models/")) return m;
   return `models/${m}`;
@@ -34,12 +33,8 @@ function asText(v) {
 }
 
 function pickTranscriptsFromMsg(msg) {
-  // Live API server messages are union types; location can vary.
-  // We'll defensively scan a few likely places.
   const out = { input: "", output: "" };
 
-  // 1) Common in serverContent:
-  // serverContent.inputTranscription / outputTranscription
   if (msg?.serverContent) {
     const sc = msg.serverContent;
 
@@ -58,7 +53,6 @@ function pickTranscriptsFromMsg(msg) {
       out.output;
   }
 
-  // 2) Sometimes transcription appears top-level (SDK wrappers)
   out.input =
     out.input ||
     asText(msg?.inputTranscription) ||
@@ -73,10 +67,23 @@ function pickTranscriptsFromMsg(msg) {
     asText(msg?.output_transcription) ||
     asText(msg?.output_transcription?.text);
 
-  // Trim
   out.input = (out.input || "").trim();
   out.output = (out.output || "").trim();
   return out;
+}
+
+function normalizeSpacing(s) {
+  if (!s) return "";
+  // fix common fragmentation: "של" "ום" -> "שלום" (best-effort, low risk for logs only)
+  // We’ll just collapse multiple spaces and remove space before punctuation.
+  return String(s)
+    .replace(/\s+/g, " ")
+    .replace(/\s+([.,!?;:)\]])/g, "$1")
+    .trim();
+}
+
+function endsSentence(s) {
+  return /[.!?…]$/.test(s);
 }
 
 class GeminiLiveSession {
@@ -88,9 +95,65 @@ class GeminiLiveSession {
     this.ready = false;
     this.closed = false;
 
-    // prevent spam duplicates
-    this._lastInputT = "";
-    this._lastOutputT = "";
+    // transcript buffers (logs-only)
+    this._userBuf = "";
+    this._botBuf = "";
+    this._userFlushTimer = null;
+    this._botFlushTimer = null;
+
+    this._lastRawInput = "";
+    this._lastRawOutput = "";
+  }
+
+  _flushUser() {
+    if (!this._userBuf) return;
+    const text = normalizeSpacing(this._userBuf);
+    this._userBuf = "";
+    if (!text) return;
+
+    // Put the readable text in msg so Render logs UI shows it clearly
+    logger.info(`TRANSCRIPT user: ${text}`, { ...this.meta });
+    if (this.onGeminiText) this.onGeminiText(`USER: ${text}`);
+  }
+
+  _flushBot() {
+    if (!this._botBuf) return;
+    const text = normalizeSpacing(this._botBuf);
+    this._botBuf = "";
+    if (!text) return;
+
+    logger.info(`TRANSCRIPT bot: ${text}`, { ...this.meta });
+    if (this.onGeminiText) this.onGeminiText(`BOT: ${text}`);
+  }
+
+  _appendUserChunk(chunk) {
+    const c = normalizeSpacing(chunk);
+    if (!c) return;
+
+    // If it’s a continuation fragment, add space unless it’s punctuation.
+    if (this._userBuf && !/^[.,!?;:]/.test(c)) this._userBuf += " ";
+    this._userBuf += c;
+
+    if (this._userFlushTimer) clearTimeout(this._userFlushTimer);
+    // flush quickly so you see near-realtime logs
+    this._userFlushTimer = setTimeout(() => this._flushUser(), 350);
+  }
+
+  _appendBotChunk(chunk) {
+    const c = normalizeSpacing(chunk);
+    if (!c) return;
+
+    if (this._botBuf && !/^[.,!?;:]/.test(c)) this._botBuf += " ";
+    this._botBuf += c;
+
+    if (endsSentence(c) || endsSentence(this._botBuf)) {
+      if (this._botFlushTimer) clearTimeout(this._botFlushTimer);
+      this._flushBot();
+      return;
+    }
+
+    if (this._botFlushTimer) clearTimeout(this._botFlushTimer);
+    this._botFlushTimer = setTimeout(() => this._flushBot(), 450);
   }
 
   start() {
@@ -102,9 +165,6 @@ class GeminiLiveSession {
     this.ws.on("open", () => {
       logger.info("Gemini Live WS connected", this.meta);
 
-      // IMPORTANT:
-      // - systemInstruction is a string in setup (not Content object). :contentReference[oaicite:2]{index=2}
-      // - audio transcription configs exist in setup; config object has no fields. :contentReference[oaicite:3]{index=3}
       const setupMsg = {
         setup: {
           model: normalizeModelName(env.GEMINI_LIVE_MODEL),
@@ -121,7 +181,7 @@ class GeminiLiveSession {
         }
       };
 
-      // Enable transcription ONLY if requested (your env MB_LOG_TRANSCRIPTS=true)
+      // Enable transcription only if requested
       if (env.MB_LOG_TRANSCRIPTS) {
         setupMsg.setup.inputAudioTranscription = {};
         setupMsg.setup.outputAudioTranscription = {};
@@ -143,24 +203,23 @@ class GeminiLiveSession {
         return;
       }
 
-      // (A) Transcriptions (logs)
+      // (A) Transcriptions (logs) — buffered and shown in msg
       if (env.MB_LOG_TRANSCRIPTS) {
         const t = pickTranscriptsFromMsg(msg);
 
-        if (t.input && t.input !== this._lastInputT) {
-          this._lastInputT = t.input;
-          logger.info("TRANSCRIPT user", { ...this.meta, text: t.input });
-          if (this.onGeminiText) this.onGeminiText(`USER: ${t.input}`);
+        // De-dup raw repeats
+        if (t.input && t.input !== this._lastRawInput) {
+          this._lastRawInput = t.input;
+          this._appendUserChunk(t.input);
         }
 
-        if (t.output && t.output !== this._lastOutputT) {
-          this._lastOutputT = t.output;
-          logger.info("TRANSCRIPT bot", { ...this.meta, text: t.output });
-          if (this.onGeminiText) this.onGeminiText(`BOT: ${t.output}`);
+        if (t.output && t.output !== this._lastRawOutput) {
+          this._lastRawOutput = t.output;
+          this._appendBotChunk(t.output);
         }
       }
 
-      // (B) AUDIO: look for inlineData audio/pcm and convert to ulaw8k for Twilio
+      // (B) AUDIO: inlineData audio/pcm -> ulaw8k back to Twilio
       try {
         const parts =
           msg?.serverContent?.modelTurn?.parts ||
@@ -183,7 +242,7 @@ class GeminiLiveSession {
         logger.debug("Gemini message audio parse error", { ...this.meta, error: e.message });
       }
 
-      // (C) Optional text parts (debug only)
+      // (C) Optional assistant text parts
       if (env.MB_LOG_ASSISTANT_TEXT) {
         try {
           const parts =
@@ -191,7 +250,6 @@ class GeminiLiveSession {
             msg?.serverContent?.turn?.parts ||
             msg?.serverContent?.parts ||
             [];
-
           for (const p of parts) {
             const txt = p?.text;
             if (txt) logger.info("ASSISTANT_TEXT", { ...this.meta, text: String(txt) });
@@ -202,6 +260,15 @@ class GeminiLiveSession {
 
     this.ws.on("close", (code, reasonBuf) => {
       const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
+
+      // flush any pending transcript buffers on close (logs-only)
+      try {
+        if (this._userFlushTimer) clearTimeout(this._userFlushTimer);
+        if (this._botFlushTimer) clearTimeout(this._botFlushTimer);
+        this._flushUser();
+        this._flushBot();
+      } catch {}
+
       this.closed = true;
       this.ready = false;
       logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
@@ -215,10 +282,8 @@ class GeminiLiveSession {
   sendUlaw8kFromTwilio(ulaw8kB64) {
     if (!this.ws || this.closed || !this.ready) return;
 
-    // Twilio μ-law 8k -> PCM16k base64
     const pcm16kB64 = ulaw8kB64ToPcm16kB64(ulaw8kB64);
 
-    // Keep EXACTLY what already worked for your audio path:
     const msg = {
       realtimeInput: {
         mediaChunks: [
