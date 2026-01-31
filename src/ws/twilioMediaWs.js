@@ -2,108 +2,141 @@
 "use strict";
 
 const WebSocket = require("ws");
+const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
 
-/**
- * Attaches Twilio Media Streams WebSocket endpoint:
- *  - path: /twilio-media-stream
- *  - logs start/stop + counts inbound media frames
- *  - (optional) sends a short beep test OUT but DOES NOT close the socket
- */
 function attachTwilioMediaWs(httpServer) {
   const wss = new WebSocket.Server({
     server: httpServer,
     path: "/twilio-media-stream"
   });
 
-  wss.on("connection", (ws) => {
+  wss.on("connection", (twilioWs) => {
     logger.info("Twilio media WS connected");
 
-    const state = {
-      streamSid: null,
-      callSid: null,
-      customParameters: {},
-      mediaFrames: 0,
-      mediaBytesB64: 0,
-      lastMediaAt: null,
-      statsTimer: null
-    };
+    let callSid = null;
+    let streamSid = null;
+    let geminiWs = null;
+    let geminiReady = false;
 
-    // כל 2 שניות נדפיס סטטיסטיקה כדי לראות אם נכנס RX אודיו מהמתקשר
-    state.statsTimer = setInterval(() => {
-      logger.info("Twilio RX stats", {
-        streamSid: state.streamSid,
-        callSid: state.callSid,
-        frames: state.mediaFrames,
-        b64_chars: state.mediaBytesB64,
-        last_media_at: state.lastMediaAt
+    function connectGemini() {
+      const url =
+        "wss://generativelanguage.googleapis.com/v1beta/models/" +
+        env.GEMINI_LIVE_MODEL +
+        ":streamGenerateContent?key=" +
+        env.GEMINI_API_KEY;
+
+      geminiWs = new WebSocket(url, {
+        headers: {
+          "Content-Type": "application/json"
+        }
       });
-    }, 2000);
 
-    ws.on("message", (data) => {
+      geminiWs.on("open", () => {
+        geminiReady = true;
+        logger.info("Gemini Live WS connected");
+
+        // Initial config message
+        geminiWs.send(
+          JSON.stringify({
+            setup: {
+              generation_config: {
+                audio_config: {
+                  audio_encoding: "MULAW",
+                  sample_rate_hz: 8000
+                }
+              }
+            }
+          })
+        );
+      });
+
+      geminiWs.on("message", (data) => {
+        let msg;
+        try {
+          msg = JSON.parse(data.toString("utf8"));
+        } catch {
+          return;
+        }
+
+        const audio =
+          msg?.candidates?.[0]?.content?.parts?.find(
+            (p) => p.inlineData && p.inlineData.mimeType === "audio/mulaw"
+          )?.inlineData?.data;
+
+        if (audio) {
+          // Send audio back to Twilio
+          twilioWs.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: {
+                payload: audio
+              }
+            })
+          );
+        }
+      });
+
+      geminiWs.on("close", () => {
+        geminiReady = false;
+        logger.info("Gemini Live WS closed");
+      });
+
+      geminiWs.on("error", (err) => {
+        logger.error("Gemini Live WS error", { error: err.message });
+      });
+    }
+
+    connectGemini();
+
+    twilioWs.on("message", (data) => {
       let msg;
       try {
         msg = JSON.parse(data.toString("utf8"));
-      } catch (e) {
-        logger.warn("Twilio WS non-JSON message", { len: data?.length });
+      } catch {
         return;
       }
 
-      const ev = msg.event;
-
-      if (ev === "start") {
-        state.streamSid = msg?.start?.streamSid || null;
-        state.callSid = msg?.start?.callSid || null;
-        state.customParameters = msg?.start?.customParameters || {};
-        logger.info("Twilio stream start", {
-          streamSid: state.streamSid,
-          callSid: state.callSid,
-          customParameters: state.customParameters
-        });
-
-        // NOTE: אם כבר יש אצלך פונקציית Beep קיימת – תשאיר אותה.
-        // כאן אנחנו בכוונה לא סוגרים WS אחרי הביפ/כלום.
+      if (msg.event === "start") {
+        streamSid = msg.start.streamSid;
+        callSid = msg.start.callSid;
+        logger.info("Twilio stream start", { streamSid, callSid });
         return;
       }
 
-      if (ev === "media") {
-        const payload = msg?.media?.payload || "";
-        state.mediaFrames += 1;
-        state.mediaBytesB64 += payload.length;
-        state.lastMediaAt = new Date().toISOString();
+      if (msg.event === "media") {
+        if (!geminiReady) return;
 
-        // לא נלוג כל פריים (זה רועש). מספיק הסטטיסטיקה כל 2 שניות.
+        geminiWs.send(
+          JSON.stringify({
+            input: {
+              audio: {
+                data: msg.media.payload,
+                encoding: "MULAW",
+                sample_rate_hz: 8000
+              }
+            }
+          })
+        );
         return;
       }
 
-      if (ev === "stop") {
-        logger.info("Twilio stream stop", {
-          streamSid: state.streamSid,
-          callSid: state.callSid
-        });
+      if (msg.event === "stop") {
+        logger.info("Twilio stream stop", { streamSid, callSid });
         return;
       }
-
-      // events אחרים (mark וכו')
-      logger.info("Twilio WS event", { event: ev, streamSid: state.streamSid, callSid: state.callSid });
     });
 
-    ws.on("close", () => {
-      if (state.statsTimer) clearInterval(state.statsTimer);
-      logger.info("Twilio media WS closed", {
-        streamSid: state.streamSid,
-        callSid: state.callSid,
-        frames: state.mediaFrames,
-        b64_chars: state.mediaBytesB64
-      });
+    twilioWs.on("close", () => {
+      logger.info("Twilio media WS closed", { streamSid, callSid });
+      try {
+        geminiWs && geminiWs.close();
+      } catch {}
     });
 
-    ws.on("error", (err) => {
-      logger.error("Twilio WS error", {
-        streamSid: state.streamSid,
-        callSid: state.callSid,
-        error: err?.message || String(err)
-      });
+    twilioWs.on("error", (err) => {
+      logger.error("Twilio WS error", { error: err.message });
     });
   });
 }
