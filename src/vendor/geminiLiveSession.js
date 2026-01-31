@@ -2,158 +2,212 @@
 "use strict";
 
 const WebSocket = require("ws");
+const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
+const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
 
-// Per docs: endpoint for Live API websocket sessions
-// wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent
-// (v1beta) :contentReference[oaicite:2]{index=2}
-const LIVE_WS_BASE =
-  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+class GeminiLiveSession {
+  constructor({ onGeminiAudioUlaw8kBase64, onGeminiText }) {
+    this.onGeminiAudioUlaw8kBase64 = onGeminiAudioUlaw8kBase64;
+    this.onGeminiText = onGeminiText;
 
-function ensureModelsPrefix(model) {
-  if (!model) return "";
-  return model.startsWith("models/") ? model : `models/${model}`;
-}
+    this.streamSid = null;
+    this.callSid = null;
+    this.customParameters = {};
 
-function safeJsonParse(s) {
-  try { return JSON.parse(s); } catch { return null; }
-}
+    this._geminiWs = null;
+    this._started = false;
+    this._setupAck = false;
+    this._stopping = false;
 
-function createGeminiLiveSession({
-  apiKey,
-  model,
-  voiceName,
-  responseModalities,
-  systemInstruction
-}) {
-  let ws = null;
-
-  const handlers = {
-    open: [],
-    close: [],
-    error: [],
-    audio_pcm16le_24000: []
-  };
-
-  function on(evt, fn) {
-    handlers[evt].push(fn);
+    // small buffer until setup completes
+    this._pendingAudio = [];
   }
 
-  function emit(evt, arg) {
-    for (const fn of handlers[evt] || []) {
-      try { fn(arg); } catch {}
+  async start() {
+    if (this._started) return;
+    this._started = true;
+
+    if (!env.GEMINI_API_KEY) {
+      throw new Error("Missing GEMINI_API_KEY");
     }
-  }
+    if (!env.GEMINI_LIVE_MODEL) {
+      throw new Error("Missing GEMINI_LIVE_MODEL");
+    }
 
-  function send(obj) {
-    if (!ws || ws.readyState !== ws.OPEN) return;
-    ws.send(JSON.stringify(obj));
-  }
+    // Live API WS endpoint (v1beta)
+    // Docs: wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent :contentReference[oaicite:2]{index=2}
+    const url =
+      "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
+      `?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
 
-  async function connect() {
-    if (!apiKey) throw new Error("Missing GEMINI_API_KEY");
-    if (!model) throw new Error("Missing GEMINI_LIVE_MODEL");
+    const ws = new WebSocket(url, {
+      perMessageDeflate: false,
+      handshakeTimeout: 15000,
+      maxPayload: 16 * 1024 * 1024,
+    });
 
-    // Auth with API key: most implementations append ?key=... for WS.
-    // (Endpoint itself is as in docs) :contentReference[oaicite:3]{index=3}
-    const url = `${LIVE_WS_BASE}?key=${encodeURIComponent(apiKey)}`;
-
-    ws = new WebSocket(url);
+    this._geminiWs = ws;
 
     ws.on("open", () => {
-      // Required initial setup message after WS connect :contentReference[oaicite:4]{index=4}
-      const setup = {
+      logger.info("Gemini Live WS connected", { callSid: this.callSid, streamSid: this.streamSid });
+
+      // IMPORTANT:
+      // setup.systemInstruction is STRING (not Content object) and field name is camelCase. :contentReference[oaicite:3]{index=3}
+      const systemInstruction = this._buildSystemInstruction();
+
+      const setupMsg = {
         setup: {
-          model: ensureModelsPrefix(model),
+          model: this._normalizeModel(env.GEMINI_LIVE_MODEL),
+          systemInstruction,
           generationConfig: {
-            responseModalities: responseModalities && responseModalities.length ? responseModalities : ["AUDIO"],
-            // Ask for speech (voice). Exact knobs evolve; this is a safe minimal config.
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: voiceName || "Kore"
-                }
-              }
-            }
+            responseModalities: ["AUDIO"],
+            // low-latency defaults; you can tune later
+            temperature: 0.4,
           },
-          systemInstruction: systemInstruction || ""
-        }
+        },
       };
 
-      send(setup);
-      emit("open");
+      ws.send(JSON.stringify(setupMsg));
     });
 
     ws.on("message", (data) => {
-      const msg = safeJsonParse(data.toString("utf8"));
-      if (!msg) return;
+      let msg;
+      try {
+        msg = JSON.parse(data.toString("utf8"));
+      } catch {
+        // sometimes servers can send non-json, ignore
+        return;
+      }
 
-      // We handle audio in a tolerant way because message shapes may vary in preview.
-      // Typical pattern: serverContent -> modelTurn -> parts -> inlineData (audio) base64.
-      const parts =
-        msg.serverContent &&
-        msg.serverContent.modelTurn &&
-        Array.isArray(msg.serverContent.modelTurn.parts)
-          ? msg.serverContent.modelTurn.parts
-          : null;
+      // setupComplete ack
+      if (msg?.setupComplete) {
+        this._setupAck = true;
 
-      if (parts) {
-        for (const p of parts) {
-          const inline = p.inlineData || p.inline_data || null;
-          if (!inline) continue;
+        // flush pending audio
+        const pending = this._pendingAudio;
+        this._pendingAudio = [];
+        for (const b64 of pending) this._sendRealtimeAudio(b64);
 
-          const mime = inline.mimeType || inline.mime_type || "";
-          const b64 = inline.data || null;
-          if (!b64) continue;
+        return;
+      }
 
-          // Many live voices come back PCM; we expect PCM16LE 24k in the converter.
-          // If it’s not PCM, we currently ignore (can be extended later).
-          if (mime.includes("audio") && mime.includes("pcm")) {
-            const buf = Buffer.from(b64, "base64");
-            emit("audio_pcm16le_24000", buf);
+      // serverContent: can contain modelTurn parts incl audio inlineData
+      const serverContent = msg?.serverContent;
+      if (serverContent?.modelTurn?.parts?.length) {
+        for (const part of serverContent.modelTurn.parts) {
+          // audio chunk
+          if (part?.inlineData?.data && part?.inlineData?.mimeType) {
+            const mime = part.inlineData.mimeType;
+
+            // We expect PCM back (often 24k). Convert -> ulaw8k for Twilio.
+            // If mime includes rate=24000 => convert accordingly (this helper assumes 24k PCM16 LE).
+            if (mime.startsWith("audio/pcm")) {
+              const b64Pcm = part.inlineData.data;
+              const b64Ulaw = pcm24kB64ToUlaw8kB64(b64Pcm);
+              if (b64Ulaw) this.onGeminiAudioUlaw8kBase64(b64Ulaw);
+            }
+          }
+
+          // sometimes text is returned as well
+          if (typeof part?.text === "string" && part.text.trim()) {
+            this.onGeminiText(part.text);
           }
         }
       }
+
+      // toolCall / etc can come later; ignore for MVP
     });
 
-    ws.on("close", (code, reason) => {
-      emit("close", { code, reason: reason ? reason.toString() : "" });
+    ws.on("close", (code, reasonBuf) => {
+      const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
+      logger.info("Gemini Live WS closed", {
+        callSid: this.callSid,
+        streamSid: this.streamSid,
+        code,
+        reason,
+      });
     });
 
     ws.on("error", (err) => {
-      emit("error", err);
+      logger.error("Gemini Live WS error", { error: err.message });
     });
   }
 
-  function sendAudioUlaw8k(payloadB64) {
-    if (!payloadB64) return;
+  pushTwilioUlaw8k(twilioUlawB64) {
+    if (!this._geminiWs) return;
+    if (this._stopping) return;
 
-    // Send realtime input audio chunks
-    // We declare the mimeType as μ-law 8k (Twilio format).
-    send({
+    // Twilio ulaw8k base64 -> PCM16k base64
+    const pcm16kB64 = ulaw8kB64ToPcm16kB64(twilioUlawB64);
+    if (!pcm16kB64) return;
+
+    if (!this._setupAck) {
+      // buffer until setupComplete
+      this._pendingAudio.push(pcm16kB64);
+      if (this._pendingAudio.length > 50) this._pendingAudio.shift(); // cap
+      return;
+    }
+
+    this._sendRealtimeAudio(pcm16kB64);
+  }
+
+  _sendRealtimeAudio(pcm16kB64) {
+    const ws = this._geminiWs;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    // realtimeInput.audio is Blob (mimeType+data) :contentReference[oaicite:4]{index=4}
+    const msg = {
       realtimeInput: {
-        mediaChunks: [
-          {
-            mimeType: "audio/ulaw;rate=8000",
-            data: payloadB64
-          }
-        ]
-      }
+        audio: {
+          mimeType: "audio/pcm;rate=16000",
+          data: pcm16kB64,
+        },
+      },
+    };
+
+    ws.send(JSON.stringify(msg));
+  }
+
+  async stop(reason) {
+    if (this._stopping) return;
+    this._stopping = true;
+
+    logger.info("Session cleanup", {
+      reason,
+      streamSid: this.streamSid,
+      callSid: this.callSid,
     });
-  }
 
-  async function close() {
     try {
-      if (ws && ws.readyState === ws.OPEN) ws.close();
+      if (this._geminiWs && this._geminiWs.readyState === WebSocket.OPEN) {
+        // tell server audio stream ended (optional)
+        this._geminiWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+      }
     } catch {}
+
+    try {
+      if (this._geminiWs) this._geminiWs.close();
+    } catch {}
+
+    this._geminiWs = null;
   }
 
-  return {
-    on,
-    connect,
-    close,
-    sendAudioUlaw8k
-  };
+  _normalizeModel(modelEnv) {
+    // Accept either "models/..." or raw name
+    if (modelEnv.startsWith("models/")) return modelEnv;
+    return `models/${modelEnv}`;
+  }
+
+  _buildSystemInstruction() {
+    // MVP: keep it minimal. We’ll later inject SSOT prompts, languages, lead rules, closing hangup, etc.
+    // NOTE: Live API expects STRING here. :contentReference[oaicite:5]{index=5}
+    return [
+      "You are a Hebrew phone voice assistant for a business.",
+      "Be concise and natural.",
+      "Ask one question at a time.",
+    ].join(" ");
+  }
 }
 
-module.exports = { createGeminiLiveSession };
+module.exports = { GeminiLiveSession };
