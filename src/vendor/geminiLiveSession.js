@@ -14,9 +14,6 @@ function normalizeModelName(m) {
 function liveWsUrl() {
   const key = env.GEMINI_API_KEY;
   if (!key) throw new Error("Missing GEMINI_API_KEY");
-
-  // Live API WebSocket endpoint (API key)
-  // wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=...
   return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
     key
   )}`;
@@ -26,42 +23,34 @@ class GeminiLiveSession {
   constructor({ onGeminiAudioUlaw8kBase64, onGeminiText, onTranscript, meta }) {
     this.onGeminiAudioUlaw8kBase64 = onGeminiAudioUlaw8kBase64;
     this.onGeminiText = onGeminiText;
-    this.onTranscript = onTranscript;
+    this.onTranscript = onTranscript; // (role, text)
     this.meta = meta || {};
-
     this.ws = null;
     this.ready = false;
     this.closed = false;
-
-    this._setupSent = false;
   }
 
   start() {
     if (this.ws) return;
 
     const url = liveWsUrl();
-    this.ws = new WebSocket(url);
+
+    // IMPORTANT: Live WS may deliver frames that trigger UTF-8 validation failures.
+    // We disable validation and handle binary frames safely.
+    this.ws = new WebSocket(url, {
+      perMessageDeflate: false,
+      skipUTF8Validation: true
+    });
 
     this.ws.on("open", () => {
       logger.info("Gemini Live WS connected", this.meta);
 
-      // חשוב: systemInstruction הוא STRING (לא Content)
-      // כדי שלא נקבל 1007 על type mismatch. :contentReference[oaicite:1]{index=1}
-      const systemInstruction =
-        "את/ה עוזר/ת קולי/ת לעסקים. ברירת מחדל: עברית. אם הלקוח מדבר בשפה אחרת, ענה באותה שפה. " +
-        "ענה בקצרה, שאל שאלת הבהרה אחת בכל פעם. אל תמציא פרטים.";
-
+      // Keep MVP stable: no system_instruction to avoid 1007.
       const setup = {
         setup: {
           model: normalizeModelName(env.GEMINI_LIVE_MODEL),
-          systemInstruction,
           generationConfig: {
-            // הכי חשוב לקול:
             responseModalities: ["AUDIO"],
-            // קיצור latency: מגביל אורך תגובה
-            maxOutputTokens: 160,
-            // אפשר לכוונן:
-            temperature: 0.4,
             speechConfig: {
               voiceConfig: {
                 prebuiltVoiceConfig: {
@@ -75,14 +64,20 @@ class GeminiLiveSession {
 
       try {
         this.ws.send(JSON.stringify(setup));
-        this._setupSent = true;
         this.ready = true;
       } catch (e) {
         logger.error("Failed to send Gemini setup", { ...this.meta, error: e.message });
       }
     });
 
-    this.ws.on("message", (data) => {
+    this.ws.on("message", (data, isBinary) => {
+      // If Gemini sends binary frames, do NOT try to parse as UTF-8 JSON.
+      if (isBinary) {
+        // We ignore unknown binary frames to keep session alive.
+        logger.debug("Gemini binary frame ignored", { ...this.meta, bytes: data?.length || 0 });
+        return;
+      }
+
       let msg;
       try {
         msg = JSON.parse(data.toString("utf8"));
@@ -90,7 +85,7 @@ class GeminiLiveSession {
         return;
       }
 
-      // 1) AUDIO output
+      // ---- 1) AUDIO ----
       try {
         const parts =
           msg?.serverContent?.modelTurn?.parts ||
@@ -103,6 +98,7 @@ class GeminiLiveSession {
           if (!inline || !inline?.data || !inline?.mimeType) continue;
 
           if (String(inline.mimeType).startsWith("audio/pcm")) {
+            // Gemini usually returns PCM base64 at 24k; convert to ulaw8k for Twilio
             const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
             if (ulawB64 && this.onGeminiAudioUlaw8kBase64) {
               this.onGeminiAudioUlaw8kBase64(ulawB64);
@@ -113,7 +109,8 @@ class GeminiLiveSession {
         logger.debug("Gemini audio parse error", { ...this.meta, error: e.message });
       }
 
-      // 2) TEXT parts (sometimes model emits text parts too)
+      // ---- 2) TEXT / TRANSCRIPTS ----
+      // We keep it permissive: if text exists in parts, emit it.
       try {
         const parts =
           msg?.serverContent?.modelTurn?.parts ||
@@ -123,31 +120,13 @@ class GeminiLiveSession {
 
         for (const p of parts) {
           const t = p?.text;
-          if (t && this.onGeminiText) this.onGeminiText(String(t));
+          if (!t) continue;
+
+          if (this.onGeminiText) this.onGeminiText(String(t));
+
+          // If caller wired transcript logger, treat model text as bot transcript
+          if (this.onTranscript) this.onTranscript("bot", String(t));
         }
-      } catch {}
-
-      // 3) Transcription (best effort)
-      // הדוקס מגדיר שהודעות/אירועים מגיעים מהשרת; בפועל יש כמה צורות.
-      // אנחנו אוספים כל מה שנראה כמו תמלול קלט/פלט בלי לשנות setup (כדי לא לשבור קול). :contentReference[oaicite:2]{index=2}
-      try {
-        // user transcript candidates
-        const inT =
-          msg?.serverContent?.inputTranscription?.text ||
-          msg?.serverContent?.transcription?.text ||
-          msg?.inputTranscription?.text ||
-          null;
-
-        if (inT && this.onTranscript) this.onTranscript("user", String(inT));
-
-        // bot transcript candidates
-        const outT =
-          msg?.serverContent?.outputTranscription?.text ||
-          msg?.serverContent?.modelTranscription?.text ||
-          msg?.outputTranscription?.text ||
-          null;
-
-        if (outT && this.onTranscript) this.onTranscript("bot", String(outT));
       } catch {}
     });
 
@@ -155,11 +134,7 @@ class GeminiLiveSession {
       const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
       this.closed = true;
       this.ready = false;
-
       logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
-
-      // אם נסגר מיד אחרי חיבור – זה בדרך כלל setup בעייתי.
-      // אל תנסה “אוטומטית” לשנות setup כאן כדי לא להיכנס ללופ שמשבש קול.
     });
 
     this.ws.on("error", (err) => {
@@ -170,16 +145,17 @@ class GeminiLiveSession {
   sendUlaw8kFromTwilio(ulaw8kB64) {
     if (!this.ws || this.closed || !this.ready) return;
 
+    // Twilio μ-law 8k -> PCM16k base64
     const pcm16kB64 = ulaw8kB64ToPcm16kB64(ulaw8kB64);
 
-    // Live API realtimeInput audioStream
-    // לפי הדוקס: realtimeInput.audio הוא Blob, וגם audioStreamEnd אפשרי. :contentReference[oaicite:3]{index=3}
     const msg = {
       realtimeInput: {
-        audio: {
-          mimeType: "audio/pcm;rate=16000",
-          data: pcm16kB64
-        }
+        mediaChunks: [
+          {
+            mimeType: "audio/pcm;rate=16000",
+            data: pcm16kB64
+          }
+        ]
       }
     };
 
