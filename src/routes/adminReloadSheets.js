@@ -1,25 +1,15 @@
-// src/routes/adminReloadSheets.js
 "use strict";
 
 const express = require("express");
-const { loadSSOT } = require("../ssot/ssotClient");
+const { loadSSOT, getSSOTSnapshot } = require("../ssot/ssotClient");
 const { env } = require("../config/env");
 
 const router = express.Router();
 
 router.post("/admin/reload-sheets", async (req, res) => {
+  // Auth: use x-admin-token == TWILIO_AUTH_TOKEN (כי אין MB_ADMIN_TOKEN אצלך)
   const token = req.headers["x-admin-token"];
-
-  // NOTE: we use TWILIO_AUTH_TOKEN as the admin token because we must not add new ENV names.
-  // Make sure TWILIO_AUTH_TOKEN is set in Render.
-  if (!env.TWILIO_AUTH_TOKEN) {
-    return res.status(500).json({
-      error: "server_misconfigured",
-      message: "TWILIO_AUTH_TOKEN is empty in ENV (used as admin token). Set it in Render."
-    });
-  }
-
-  if (!token || token !== env.TWILIO_AUTH_TOKEN) {
+  if (!env.TWILIO_AUTH_TOKEN || !token || token !== env.TWILIO_AUTH_TOKEN) {
     return res.status(401).json({ error: "unauthorized" });
   }
 
@@ -27,18 +17,28 @@ router.post("/admin/reload-sheets", async (req, res) => {
     const ssot = await loadSSOT(true);
     return res.status(200).json({
       ok: true,
-      reloaded_at: new Date().toISOString(),
-      loaded_at: ssot.loaded_at,
-      settings_keys: ssot.settings_keys || null,
-      prompt_ids: ssot.prompt_ids || null,
-      intents: ssot.intents_count || null
+      reloaded_at: ssot.loaded_at,
+      settings_keys: ssot.settings_keys,
+      prompt_ids: ssot.prompt_ids,
+      intents: ssot.intents_count
     });
   } catch (err) {
     return res.status(500).json({
+      ok: false,
       error: "reload_failed",
       message: err.message
     });
   }
+});
+
+// Optional: debug read (still protected)
+router.get("/admin/ssot", async (req, res) => {
+  const token = req.headers["x-admin-token"];
+  if (!env.TWILIO_AUTH_TOKEN || !token || token !== env.TWILIO_AUTH_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const snap = getSSOTSnapshot();
+  return res.status(200).json({ ok: true, ssot: snap || null });
 });
 
 module.exports = { adminReloadRouter: router };
