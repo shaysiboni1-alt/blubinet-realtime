@@ -3,7 +3,11 @@
 const { env } = require("../config/env");
 
 function log(level, msg, meta) {
-  const line = { time: new Date().toISOString(), level, msg };
+  const line = {
+    time: new Date().toISOString(),
+    level,
+    msg
+  };
   if (meta && typeof meta === "object") line.meta = meta;
   console.log(JSON.stringify(line));
 }
