@@ -17,22 +17,31 @@ function createSessionState({ callSid, streamSid, caller, called }) {
     streamSid,
     caller: caller || "",
     called: called || "",
-    transcripts_in: [],  // caller
+    transcripts_in: [], // caller
     transcripts_out: [], // bot
     assistant_text: [],
     last_user_utterance: ""
   };
 }
 
-function attachTwilioMediaWs(server /* http server OR express app.listen server */) {
+/**
+ * Install Twilio Media Stream WS endpoint on an existing HTTP server
+ * Path: /twilio-media-stream
+ */
+function installTwilioMediaWs(httpServer) {
   const wss = new WebSocket.Server({ noServer: true });
 
-  // If you already mount WS differently, keep your current mount.
-  server.on("upgrade", (req, socket, head) => {
-    if (!req.url || !req.url.startsWith("/twilio-media-stream")) return;
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
+  httpServer.on("upgrade", (req, socket, head) => {
+    try {
+      if (!req.url || !req.url.startsWith("/twilio-media-stream")) return;
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req);
+      });
+    } catch (e) {
+      try {
+        socket.destroy();
+      } catch (_) {}
+    }
   });
 
   wss.on("connection", (twilioWs) => {
@@ -42,7 +51,6 @@ function attachTwilioMediaWs(server /* http server OR express app.listen server 
     let gemini = null;
 
     function sendTwilioAudio(mediaBase64) {
-      // Twilio expects: {event:"media", streamSid, media:{payload:"base64"}}
       if (twilioWs.readyState !== WebSocket.OPEN) return;
       if (!state.streamSid) return;
 
@@ -60,6 +68,7 @@ function attachTwilioMediaWs(server /* http server OR express app.listen server 
         streamSid: state.streamSid,
         callSid: state.callSid
       });
+
       try {
         if (gemini) gemini.stop();
       } catch (_) {}
@@ -94,28 +103,44 @@ function attachTwilioMediaWs(server /* http server OR express app.listen server 
           customParameters: cp
         });
 
-        // Start Gemini session (system instruction can come later from SSOT; keep minimal now)
+        // Start Gemini Live session
         gemini = new GeminiLiveSession({
           callSid: state.callSid,
           streamSid: state.streamSid,
-          systemInstructionText:
-            "ענה בעברית כברירת מחדל. אם המשתמש מבקש שפה אחרת, עבור בהתאם.",
-          onGeminiAudioUlaw8kBase64: (audioB64, meta) => {
-            // Forward back to Twilio
+          systemInstructionText: "ענה בעברית כברירת מחדל. אם המשתמש מבקש שפה אחרת, עבור בהתאם.",
+          onGeminiAudioUlaw8kBase64: (audioB64) => {
             sendTwilioAudio(audioB64);
           },
           onGeminiInputTranscript: (t) => {
             state.transcripts_in.push(t);
-            state.last_user_utterance = t; // last chunk (good enough for now)
+            state.last_user_utterance = t;
+            if (env.MB_LOG_TRANSCRIPTS) {
+              logger.info("Transcript IN", {
+                callSid: state.callSid,
+                streamSid: state.streamSid,
+                text: t
+              });
+            }
           },
           onGeminiOutputTranscript: (t) => {
             state.transcripts_out.push(t);
+            if (env.MB_LOG_TRANSCRIPTS) {
+              logger.info("Transcript OUT", {
+                callSid: state.callSid,
+                streamSid: state.streamSid,
+                text: t
+              });
+            }
           },
           onGeminiText: (t) => {
-            if (env.MB_LOG_ASSISTANT_TEXT) {
-              logger.info("Assistant text", { callSid: state.callSid, streamSid: state.streamSid, text: t });
-            }
             state.assistant_text.push(t);
+            if (env.MB_LOG_ASSISTANT_TEXT) {
+              logger.info("Assistant text", {
+                callSid: state.callSid,
+                streamSid: state.streamSid,
+                text: t
+              });
+            }
           }
         });
 
@@ -128,17 +153,14 @@ function attachTwilioMediaWs(server /* http server OR express app.listen server 
             error: err && err.message ? err.message : String(err)
           });
         }
-
         return;
       }
 
       if (evt.event === "media") {
-        // Incoming audio from Twilio -> Gemini
         if (!gemini) return;
         const payload = evt.media && evt.media.payload ? evt.media.payload : "";
         if (!payload) return;
 
-        // Send as-is (your bridge currently works; do not change formats here)
         gemini.sendAudioUlaw8kBase64(payload);
         return;
       }
@@ -174,4 +196,4 @@ function attachTwilioMediaWs(server /* http server OR express app.listen server 
   return wss;
 }
 
-module.exports = { attachTwilioMediaWs };
+module.exports = { installTwilioMediaWs };
