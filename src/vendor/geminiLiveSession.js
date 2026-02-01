@@ -4,6 +4,7 @@ const WebSocket = require("ws");
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
 const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
+const { detectIntent } = require("../logic/intentRouter");
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -116,7 +117,6 @@ function buildSystemInstructionFromSSOT(ssot) {
 }
 
 function computeGreetingHebrew(timeZone) {
-  // Default Israel if not provided
   const tz = timeZone || "Asia/Jerusalem";
 
   const hourStr = new Intl.DateTimeFormat("en-US", {
@@ -316,14 +316,14 @@ class GeminiLiveSession {
     const c = chunk || "";
     if (!c) return;
 
-    // Ignore exact duplicates (you had lots of duplicates)
+    // Ignore exact duplicates
     if (c === this._trLastChunk[who]) return;
     this._trLastChunk[who] = c;
 
     // Append chunk, cap size
     this._trBuf[who] = (this._trBuf[who] + c).slice(-800);
 
-    // Debounce flush so you get one readable line per utterance-ish
+    // Debounce flush
     if (this._trTimer[who]) clearTimeout(this._trTimer[who]);
     this._trTimer[who] = setTimeout(() => this._flushTranscript(who), 450);
   }
@@ -340,8 +340,22 @@ class GeminiLiveSession {
     this._trBuf[who] = "";
     if (!text) return;
 
-    // One clean log line, easy to read in Render UI
+    // Existing log
     logger.info(`UTTERANCE ${who}`, { ...this.meta, text });
+
+    // ✅ NEW: Deterministic intent log ONLY for user utterances
+    if (who === "user") {
+      const intent = detectIntent({
+        text,
+        intents: this.ssot?.intents || []
+      });
+
+      logger.info("INTENT_DETECTED", {
+        ...this.meta,
+        text,
+        intent
+      });
+    }
 
     if (this.onTranscript) this.onTranscript({ who, text });
   }
