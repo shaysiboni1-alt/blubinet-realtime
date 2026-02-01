@@ -1,29 +1,18 @@
-"use strict";
-
 const WebSocket = require("ws");
-const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
+const env = require("../config/env");
 
-function buildLiveUrlDeveloper() {
-  // Live API WS endpoint (Developer API)
-  // Source: Google AI Live API docs
-  return "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+function buildWsUrl() {
+  const url = new URL("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent");
+  url.searchParams.set("key", env.GEMINI_API_KEY);
+  return url.toString();
 }
 
 function createGeminiLiveClient({ callSid, streamSid, systemPromptText }) {
-  if (!env.GEMINI_API_KEY) {
-    throw new Error("Missing GEMINI_API_KEY");
-  }
-  if (!env.GEMINI_LIVE_MODEL) {
-    throw new Error("Missing GEMINI_LIVE_MODEL");
-  }
-
-  const url = buildLiveUrlDeveloper();
-
-  const ws = new WebSocket(url, {
+  const ws = new WebSocket(buildWsUrl(), {
     headers: {
-      "x-goog-api-key": env.GEMINI_API_KEY
-    }
+      "Content-Type": "application/json",
+    },
   });
 
   let isReady = false;
@@ -31,51 +20,89 @@ function createGeminiLiveClient({ callSid, streamSid, systemPromptText }) {
   ws.on("open", () => {
     logger.info("Gemini Live WS connected", { callSid, streamSid });
 
-    // Setup message (best-effort schema; robust on receive)
+    // Hard guardrails (we want only spoken output; no meta / no markdown / no analysis).
+    // Gemini Live may still emit text parts; we instruct strongly to avoid that.
+    const hardRules = [
+      "ענה בעברית בלבד, טבעי וקצר.",
+      "אל תסביר מה אתה עושה. אל תציג מחשבות/ניתוח/תהליך.",
+      "אל תכתוב כותרות, בולטים, Markdown או טקסט באנגלית.",
+      "הפק רק את מה שצריך לומר למתקשר בקול.",
+    ].join("\n");
+
     const setup = {
       setup: {
-        model: `models/${env.GEMINI_LIVE_MODEL}`,
-        generation_config: {
-          // אנחנו רוצים אודיו חזרה
-          response_modalities: ["AUDIO"]
+        model: env.GEMINI_LIVE_MODEL,
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          // Helps keep the model terse; audio models still may vary.
+          temperature: 0.4,
         },
-        // נתחיל בעברית; בהמשך ניישר לפי SSOT שפות.
-        system_instruction: {
-          parts: [{ text: systemPromptText || "דבר בעברית בצורה טבעית וקצרה." }]
-        }
-      }
+        systemInstruction: {
+          parts: [
+            {
+              text: `${hardRules}\n\n${systemPromptText || ""}`.trim(),
+            },
+          ],
+        },
+      },
     };
 
     ws.send(JSON.stringify(setup));
-    isReady = true;
+  });
+
+  ws.on("message", (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString("utf8"));
+    } catch {
+      return;
+    }
+
+    // Setup completion / readiness
+    if (msg?.setupComplete) {
+      isReady = true;
+      logger.info("Gemini setupComplete", { callSid, streamSid });
+      return;
+    }
+
+    // Let callers consume raw events if they want
+    if (ws.onGeminiEvent) ws.onGeminiEvent(msg);
+  });
+
+  ws.on("close", (code, reason) => {
+    logger.info("Gemini Live WS closed", { callSid, streamSid, code, reason: String(reason || "") });
   });
 
   ws.on("error", (err) => {
-    logger.error("Gemini Live WS error", { error: err.message || String(err), callSid, streamSid });
+    logger.error("Gemini Live WS error", { callSid, streamSid, err: String(err?.message || err) });
   });
 
-  ws.on("close", () => {
-    logger.info("Gemini Live WS closed", { callSid, streamSid });
-  });
-
-  function sendAudioBase64Pcmu(b64) {
-    if (!isReady || ws.readyState !== WebSocket.OPEN) return;
-
-    const msg = {
-      realtime_input: {
-        media_chunks: [
+  function sendAudioUlaw8kB64(ulaw8kB64) {
+    if (!isReady) return;
+    const input = {
+      realtimeInput: {
+        mediaChunks: [
           {
-            mime_type: "audio/pcmu",
-            data: b64
-          }
-        ]
-      }
+            mimeType: "audio/ulaw",
+            data: ulaw8kB64,
+          },
+        ],
+      },
     };
-
-    ws.send(JSON.stringify(msg));
+    ws.send(JSON.stringify(input));
   }
 
-  return { ws, sendAudioBase64Pcmu };
+  function close() {
+    try {
+      ws.close();
+    } catch {}
+  }
+
+  return {
+    ws,
+    sendAudioUlaw8kB64,
+    close,
+  };
 }
 
 module.exports = { createGeminiLiveClient };
