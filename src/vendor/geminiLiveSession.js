@@ -25,31 +25,21 @@ function safeText(v) {
 }
 
 function buildSystemInstructionContent({ ssot }) {
-  // IMPORTANT:
-  // Live API expects setup.systemInstruction as Content (not a raw string).
-  // Content shape: { role: "system", parts: [{ text: "..." }] }
   const settings = ssot?.settings || {};
   const prompts = ssot?.prompts || {};
   const intents = Array.isArray(ssot?.intents) ? ssot.intents : [];
 
-  // מינימום "לא לשבור קול": אנחנו נותנים System Instruction קצר/נקי,
-  // עם מקום להרחבה בהמשך.
   const lines = [];
 
-  // שפה/התנהגות בסיסית
   lines.push("אתה בוט קולי טלפוני. דבר עברית כברירת מחדל, אלא אם המשתמש מבקש שפה אחרת.");
   lines.push("ענה בקצרה, טבעי, שירותי, בלי חפירות. שאל שאלת הבהרה אחת בכל פעם אם צריך.");
   lines.push("אם המשתמש מבקש 'עברית' – עברית. אם מבקש 'English' – אנגלית.");
 
-  // SSOT SETTINGS (רק מה שקיים)
-  // אם יש לך מפתחות סטנדרטיים אצלך בשיטס (לדוגמה BUSINESS_NAME), זה ייכנס אוטומטית.
   const businessName = settings.BUSINESS_NAME || settings.BRAND_NAME || "";
   if (businessName) lines.push(`המותג/עסק: ${businessName}`);
 
-  // אינטנטים – כרגע רק תזכורת לקיום (נחבר Router מלא בשלב הבא)
   if (intents.length) lines.push(`קיימים ${intents.length} אינטנטים מוגדרים ב-SSOT. עבוד לפיהם כאשר הם זמינים.`);
 
-  // PROMPTS רלוונטיים (לא דוחפים את הכל)
   if (prompts.TONE) lines.push(`הנחיית טון: ${safeText(prompts.TONE)}`);
 
   const text = lines.filter(Boolean).join("\n");
@@ -98,7 +88,6 @@ class GeminiLiveSession {
             }
           },
 
-          // תמלול (רק אם ביקשתם ב-ENV)
           ...(env.MB_LOG_TRANSCRIPTS
             ? {
                 inputAudioTranscription: {},
@@ -106,18 +95,14 @@ class GeminiLiveSession {
               }
             : {}),
 
-          // VAD/BARGE-IN (רק שדות "בטוחים" שתואמים לדוקומנטציה)
           realtimeInputConfig: {
             automaticActivityDetection: {
               prefixPaddingMs: Number(env.MB_VAD_PREFIX_MS || 200),
               silenceDurationMs: Number(env.MB_VAD_SILENCE_MS || 900)
             },
-            ...(env.MB_BARGEIN_ENABLED
-              ? { activityHandling: "START_OF_ACTIVITY_INTERRUPTS" }
-              : {})
+            ...(env.MB_BARGEIN_ENABLED ? { activityHandling: "START_OF_ACTIVITY_INTERRUPTS" } : {})
           },
 
-          // SSOT → System Instruction בפורמט Content (לא מחרוזת)
           systemInstruction: buildSystemInstructionContent({ ssot: this.ssot })
         }
       };
@@ -128,6 +113,30 @@ class GeminiLiveSession {
         this.ready = true;
       } catch (e) {
         logger.error("Failed to send Gemini setup", { ...this.meta, error: e.message });
+        return;
+      }
+
+      // ✅ קריטי לדיליי: שולחים OPENING מיד אחרי setup, לא מחכים להודעה מהשרת.
+      try {
+        const opening = safeText(this.ssot?.prompts?.OPENING).trim();
+        if (opening) {
+          const openTurn = {
+            clientContent: {
+              turns: [
+                {
+                  role: "user",
+                  parts: [{ text: opening }]
+                }
+              ],
+              turnComplete: true
+            }
+          };
+          this.ws.send(JSON.stringify(openTurn));
+        }
+        this._openingSent = true;
+      } catch (e) {
+        logger.debug("Failed to send OPENING", { ...this.meta, error: e.message });
+        this._openingSent = true;
       }
     });
 
@@ -139,32 +148,7 @@ class GeminiLiveSession {
         return;
       }
 
-      // אחרי setup מוצלח – שולחים OPENING מה-SSOT פעם אחת (אם קיים)
-      // זה יגרום לבוט לדבר "פתיח" אמיתי.
-      try {
-        if (this.ready && this._setupSent && !this._openingSent) {
-          const opening = safeText(this.ssot?.prompts?.OPENING).trim();
-          if (opening) {
-            const openTurn = {
-              clientContent: {
-                turns: [
-                  {
-                    role: "user",
-                    parts: [{ text: opening }]
-                  }
-                ],
-                turnComplete: true
-              }
-            };
-            this.ws.send(JSON.stringify(openTurn));
-            this._openingSent = true;
-          } else {
-            this._openingSent = true; // אין opening בשיטס, לא ננסה שוב
-          }
-        }
-      } catch {}
-
-      // 1) AUDIO: מחפשים inlineData audio/pcm וממירים ל-ulaw8k לטוויליו
+      // AUDIO
       try {
         const parts =
           msg?.serverContent?.modelTurn?.parts ||
@@ -187,7 +171,7 @@ class GeminiLiveSession {
         logger.debug("Gemini audio parse error", { ...this.meta, error: e.message });
       }
 
-      // 2) TEXT (אופציונלי)
+      // TEXT (optional)
       try {
         const parts =
           msg?.serverContent?.modelTurn?.parts ||
@@ -201,7 +185,7 @@ class GeminiLiveSession {
         }
       } catch {}
 
-      // 3) TRANSCRIPTS (אם מופיעים)
+      // TRANSCRIPTS
       try {
         const userT = msg?.serverContent?.inputTranscription?.text;
         if (userT && this.onTranscript) this.onTranscript({ who: "user", text: String(userT) });
@@ -226,10 +210,8 @@ class GeminiLiveSession {
   sendUlaw8kFromTwilio(ulaw8kB64) {
     if (!this.ws || this.closed || !this.ready) return;
 
-    // Twilio μ-law 8k -> PCM16k base64
     const pcm16kB64 = ulaw8kB64ToPcm16kB64(ulaw8kB64);
 
-    // Live API realtimeInput audio (הפורמט החדש; לא mediaChunks)
     const msg = {
       realtimeInput: {
         audio: {
