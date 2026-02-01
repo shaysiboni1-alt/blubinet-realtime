@@ -4,8 +4,10 @@ const WebSocket = require("ws");
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
 const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
+const { getSSOT } = require("../ssot/ssotClient");
 
 function normalizeModelName(m) {
+  // Google expects: "models/<model>"
   if (!m) return "";
   if (m.startsWith("models/")) return m;
   return `models/${m}`;
@@ -19,49 +21,37 @@ function liveWsUrl() {
   )}`;
 }
 
-function safeText(v) {
-  if (v === undefined || v === null) return "";
-  return String(v);
+function buildSystemInstructionFromSSOT() {
+  const ssot = (typeof getSSOT === "function" ? getSSOT() : null) || {};
+  const prompts = ssot.prompts || {};
+
+  const chunks = [];
+  if (prompts.SYSTEM_PROMPT) chunks.push(String(prompts.SYSTEM_PROMPT).trim());
+  if (prompts.SETTINGS_CONTEXT) chunks.push(String(prompts.SETTINGS_CONTEXT).trim());
+  if (prompts.RULES) chunks.push(String(prompts.RULES).trim());
+
+  // Hard default to avoid "Arabic-first"
+  chunks.push("שפה ברירת מחדל: עברית. אם המשתמש מבקש שפה אחרת - לעבור אליה.");
+
+  return chunks.filter(Boolean).join("\n\n").trim();
 }
 
-function buildSystemInstructionContent({ ssot }) {
-  const settings = ssot?.settings || {};
-  const prompts = ssot?.prompts || {};
-  const intents = Array.isArray(ssot?.intents) ? ssot.intents : [];
-
-  const lines = [];
-
-  lines.push("אתה בוט קולי טלפוני. דבר עברית כברירת מחדל, אלא אם המשתמש מבקש שפה אחרת.");
-  lines.push("ענה בקצרה, טבעי, שירותי, בלי חפירות. שאל שאלת הבהרה אחת בכל פעם אם צריך.");
-  lines.push("אם המשתמש מבקש 'עברית' – עברית. אם מבקש 'English' – אנגלית.");
-
-  const businessName = settings.BUSINESS_NAME || settings.BRAND_NAME || "";
-  if (businessName) lines.push(`המותג/עסק: ${businessName}`);
-
-  if (intents.length) lines.push(`קיימים ${intents.length} אינטנטים מוגדרים ב-SSOT. עבוד לפיהם כאשר הם זמינים.`);
-
-  if (prompts.TONE) lines.push(`הנחיית טון: ${safeText(prompts.TONE)}`);
-
-  const text = lines.filter(Boolean).join("\n");
-  return {
-    role: "system",
-    parts: [{ text }]
-  };
+function getGreetingFromSSOT() {
+  const ssot = (typeof getSSOT === "function" ? getSSOT() : null) || {};
+  const prompts = ssot.prompts || {};
+  return (prompts.GREETING && String(prompts.GREETING).trim()) || "שלום! במה אוכל לעזור?";
 }
 
 class GeminiLiveSession {
-  constructor({ onGeminiAudioUlaw8kBase64, onGeminiText, onTranscript, meta, ssot }) {
+  constructor({ onGeminiAudioUlaw8kBase64, onGeminiText, meta }) {
     this.onGeminiAudioUlaw8kBase64 = onGeminiAudioUlaw8kBase64;
     this.onGeminiText = onGeminiText;
-    this.onTranscript = onTranscript;
     this.meta = meta || {};
-    this.ssot = ssot || null;
-
     this.ws = null;
     this.ready = false;
     this.closed = false;
-    this._setupSent = false;
-    this._openingSent = false;
+
+    this._greetingSent = false;
   }
 
   start() {
@@ -73,70 +63,46 @@ class GeminiLiveSession {
     this.ws.on("open", () => {
       logger.info("Gemini Live WS connected", this.meta);
 
+      const systemText = buildSystemInstructionFromSSOT();
+
       const setup = {
         setup: {
           model: normalizeModelName(env.GEMINI_LIVE_MODEL),
+
+          // systemInstruction MUST be Content (object with parts), not a raw string
+          systemInstruction: systemText ? { parts: [{ text: systemText }] } : undefined,
 
           generationConfig: {
             responseModalities: ["AUDIO"],
             speechConfig: {
               voiceConfig: {
                 prebuiltVoiceConfig: {
-                  voiceName: env.VOICE_NAME_OVERRIDE || "Kore"
-                }
-              }
-            }
+                  voiceName: env.VOICE_NAME_OVERRIDE || "Kore",
+                },
+              },
+            },
           },
 
-          ...(env.MB_LOG_TRANSCRIPTS
-            ? {
-                inputAudioTranscription: {},
-                outputAudioTranscription: {}
-              }
-            : {}),
-
+          // VAD + barge-in behavior (numeric fields only; avoid sensitivity enums)
           realtimeInputConfig: {
             automaticActivityDetection: {
-              prefixPaddingMs: Number(env.MB_VAD_PREFIX_MS || 200),
-              silenceDurationMs: Number(env.MB_VAD_SILENCE_MS || 900)
+              prefixPaddingMs: Number(env.MB_VAD_PREFIX_MS ?? 200),
+              silenceDurationMs: Number(env.MB_VAD_SILENCE_MS ?? 900),
             },
-            ...(env.MB_BARGEIN_ENABLED ? { activityHandling: "START_OF_ACTIVITY_INTERRUPTS" } : {})
           },
 
-          systemInstruction: buildSystemInstructionContent({ ssot: this.ssot })
-        }
+          // Enable transcripts (safe empty object shapes)
+          ...(env.MB_LOG_TRANSCRIPTS
+            ? { inputAudioTranscription: {}, outputAudioTranscription: {} }
+            : {}),
+        },
       };
 
       try {
         this.ws.send(JSON.stringify(setup));
-        this._setupSent = true;
         this.ready = true;
       } catch (e) {
         logger.error("Failed to send Gemini setup", { ...this.meta, error: e.message });
-        return;
-      }
-
-      // ✅ קריטי לדיליי: שולחים OPENING מיד אחרי setup, לא מחכים להודעה מהשרת.
-      try {
-        const opening = safeText(this.ssot?.prompts?.OPENING).trim();
-        if (opening) {
-          const openTurn = {
-            clientContent: {
-              turns: [
-                {
-                  role: "user",
-                  parts: [{ text: opening }]
-                }
-              ],
-              turnComplete: true
-            }
-          };
-          this.ws.send(JSON.stringify(openTurn));
-        }
-        this._openingSent = true;
-      } catch (e) {
-        logger.debug("Failed to send OPENING", { ...this.meta, error: e.message });
-        this._openingSent = true;
       }
     });
 
@@ -148,7 +114,14 @@ class GeminiLiveSession {
         return;
       }
 
-      // AUDIO
+      // Trigger proactive greeting as soon as setup is acknowledged
+      if (msg?.setupComplete && !this._greetingSent) {
+        this._greetingSent = true;
+        this._sendProactiveGreeting();
+        return;
+      }
+
+      // AUDIO from Gemini -> Twilio
       try {
         const parts =
           msg?.serverContent?.modelTurn?.parts ||
@@ -168,10 +141,10 @@ class GeminiLiveSession {
           }
         }
       } catch (e) {
-        logger.debug("Gemini audio parse error", { ...this.meta, error: e.message });
+        logger.debug("Gemini message parse error", { ...this.meta, error: e.message });
       }
 
-      // TEXT (optional)
+      // Optional text parts
       try {
         const parts =
           msg?.serverContent?.modelTurn?.parts ||
@@ -185,13 +158,13 @@ class GeminiLiveSession {
         }
       } catch {}
 
-      // TRANSCRIPTS
+      // Transcriptions (best-effort)
       try {
-        const userT = msg?.serverContent?.inputTranscription?.text;
-        if (userT && this.onTranscript) this.onTranscript({ who: "user", text: String(userT) });
+        const inTr = msg?.serverContent?.inputTranscription?.text;
+        if (inTr) logger.info("TRANSCRIPT user", { ...this.meta, text: String(inTr) });
 
-        const botT = msg?.serverContent?.outputTranscription?.text;
-        if (botT && this.onTranscript) this.onTranscript({ who: "bot", text: String(botT) });
+        const outTr = msg?.serverContent?.outputTranscription?.text;
+        if (outTr) logger.info("TRANSCRIPT bot", { ...this.meta, text: String(outTr) });
       } catch {}
     });
 
@@ -207,6 +180,28 @@ class GeminiLiveSession {
     });
   }
 
+  _sendProactiveGreeting() {
+    if (!this.ws || this.closed || !this.ready) return;
+
+    const greeting = getGreetingFromSSOT();
+    const userKickoff = `התחל/י שיחה עכשיו. אמור/י את הפתיח הבא בעברית, בדיוק וברצף, ואז עצור/י להקשבה:\n${greeting}`;
+
+    // clientContent.turns + turnComplete=true triggers an immediate model response
+    const msg = {
+      clientContent: {
+        turns: [{ role: "user", parts: [{ text: userKickoff }] }],
+        turnComplete: true,
+      },
+    };
+
+    try {
+      this.ws.send(JSON.stringify(msg));
+      logger.info("Proactive greeting sent", this.meta);
+    } catch (e) {
+      logger.debug("Failed sending proactive greeting", { ...this.meta, error: e.message });
+    }
+  }
+
   sendUlaw8kFromTwilio(ulaw8kB64) {
     if (!this.ws || this.closed || !this.ready) return;
 
@@ -214,11 +209,8 @@ class GeminiLiveSession {
 
     const msg = {
       realtimeInput: {
-        audio: {
-          mimeType: "audio/pcm;rate=16000",
-          data: pcm16kB64
-        }
-      }
+        mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: pcm16kB64 }],
+      },
     };
 
     try {
