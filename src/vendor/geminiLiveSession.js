@@ -5,6 +5,7 @@ const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
 const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
 const { detectIntent } = require("../logic/intentRouter");
+const { normalizeUtterance } = require("../logic/hebrewNlp");
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -202,10 +203,7 @@ class GeminiLiveSession {
             speechConfig: {
               voiceConfig: {
                 prebuiltVoiceConfig: {
-                  voiceName:
-                    env.VOICE_NAME_OVERRIDE ||
-                    safeStr(this.ssot?.settings?.VOICE_NAME) ||
-                    "Kore"
+                  voiceName: env.VOICE_NAME_OVERRIDE || safeStr(this.ssot?.settings?.VOICE_NAME) || "Kore"
                 }
               }
             }
@@ -218,9 +216,7 @@ class GeminiLiveSession {
             }
           },
 
-          ...(env.MB_LOG_TRANSCRIPTS
-            ? { inputAudioTranscription: {}, outputAudioTranscription: {} }
-            : {})
+          ...(env.MB_LOG_TRANSCRIPTS ? { inputAudioTranscription: {}, outputAudioTranscription: {} } : {})
         }
       };
 
@@ -316,14 +312,14 @@ class GeminiLiveSession {
     const c = chunk || "";
     if (!c) return;
 
-    // Ignore exact duplicates
+    // Ignore exact duplicates (you had lots of duplicates)
     if (c === this._trLastChunk[who]) return;
     this._trLastChunk[who] = c;
 
     // Append chunk, cap size
     this._trBuf[who] = (this._trBuf[who] + c).slice(-800);
 
-    // Debounce flush
+    // Debounce flush so you get one readable line per utterance-ish
     if (this._trTimer[who]) clearTimeout(this._trTimer[who]);
     this._trTimer[who] = setTimeout(() => this._flushTranscript(who), 450);
   }
@@ -340,24 +336,35 @@ class GeminiLiveSession {
     this._trBuf[who] = "";
     if (!text) return;
 
-    // Existing log
-    logger.info(`UTTERANCE ${who}`, { ...this.meta, text });
+    // ✅ Hebrew Normalization + light NLP (deterministic)
+    const nlp = normalizeUtterance(text);
 
-    // ✅ NEW: Deterministic intent log ONLY for user utterances
+    // Keep existing log line for readability, but add normalized fields (non-breaking)
+    logger.info(`UTTERANCE ${who}`, {
+      ...this.meta,
+      text: nlp.raw,
+      normalized: nlp.normalized,
+      lang: nlp.lang
+    });
+
+    // ✅ Keep deterministic intent log as in Stage2 (but use normalized text)
     if (who === "user") {
       const intent = detectIntent({
-        text,
+        text: nlp.normalized || nlp.raw,
         intents: this.ssot?.intents || []
       });
 
       logger.info("INTENT_DETECTED", {
         ...this.meta,
-        text,
+        text: nlp.raw,
+        normalized: nlp.normalized,
+        lang: nlp.lang,
         intent
       });
     }
 
-    if (this.onTranscript) this.onTranscript({ who, text });
+    // Backward-compatible callback (object form as before)
+    if (this.onTranscript) this.onTranscript({ who, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang });
   }
 
   _sendProactiveOpening() {
