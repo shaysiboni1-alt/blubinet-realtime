@@ -7,8 +7,15 @@ const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAu
 const { detectIntent } = require("../logic/intentRouter");
 const { normalizeUtterance } = require("../logic/hebrewNlp");
 
+// Optional (exists in your repo). We use it if present, but do not depend on it for core flow.
+let passiveCallContext = null;
+try {
+  // eslint-disable-next-line global-require
+  passiveCallContext = require("../logic/passiveCallContext");
+} catch { /* ignore */ }
+
 // -----------------------------------------------------------------------------
-// Helpers
+// Helpers (non-breaking, Stage4 additions are isolated)
 // -----------------------------------------------------------------------------
 
 function normalizeModelName(m) {
@@ -157,6 +164,231 @@ function getOpeningScriptFromSSOT(ssot, vars) {
   return filled || "שלום! איך נוכל לעזור?";
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function normalizeCallerId(caller) {
+  const s = (caller || "").trim();
+  const low = s.toLowerCase();
+  if (!s) return { value: "", withheld: true };
+  if (low === "anonymous" || low === "restricted" || low === "unavailable" || low === "unknown") {
+    return { value: s, withheld: true };
+  }
+  const digits = s.replace(/\D/g, "");
+  return { value: s, withheld: digits.length < 5 };
+}
+
+function extractNameHe(text) {
+  const t = (text || "").trim();
+  if (!t) return "";
+  // "קוראים לי X", "השם שלי (זה) X", "שמי X", "אני X"
+  const m = t.match(/(?:קוראים לי|השם שלי(?: זה)?|שמי|אני)\s+([^\n,.!?]{2,40})/);
+  if (m && m[1]) return m[1].trim();
+  // fallback: short token without digits
+  if (t.length <= 25 && !t.match(/[0-9]/)) return t.replace(/^אה+[, ]*/g, "").trim();
+  return "";
+}
+
+function extractPhone(text) {
+  const digits = (text || "").replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.length >= 9 && digits.length <= 13) {
+    if (digits.startsWith("972") && digits.length === 12) return `+${digits}`;
+    if (digits.startsWith("0") && digits.length === 10) return `+972${digits.slice(1)}`;
+    return digits;
+  }
+  return "";
+}
+
+function isTruthyEnv(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes" || s === "y";
+}
+
+async function safeJson(resp) {
+  try {
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Stage4: Webhooks + Recording + LeadGate + Post-call LeadParser
+// (Implemented inside the session to avoid touching ws/twilioMediaWs.js)
+// -----------------------------------------------------------------------------
+
+async function deliverWebhookDirect(eventType, payload) {
+  const map = {
+    CALL_LOG: env.CALL_LOG_WEBHOOK_URL,
+    FINAL: env.FINAL_WEBHOOK_URL,
+    ABANDONED: env.ABANDONED_WEBHOOK_URL
+  };
+  const url = map[eventType];
+  if (!url) return;
+
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    logger.info("Webhook delivered", { eventType, status: resp.status, attempt: 1 });
+  } catch (e) {
+    logger.warn("Webhook delivery failed", { eventType, error: String(e) });
+  }
+}
+
+async function twilioStartRecording(callSid) {
+  if (!callSid) return "";
+  if (!isTruthyEnv(env.MB_ENABLE_RECORDING)) return "";
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) return "";
+
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+      env.TWILIO_ACCOUNT_SID
+    )}/Calls/${encodeURIComponent(callSid)}/Recordings.json`;
+
+    const body = new URLSearchParams();
+    body.set("RecordingStatusCallbackEvent", "completed");
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        authorization:
+          "Basic " +
+          Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64"),
+        "content-type": "application/x-www-form-urlencoded"
+      },
+      body
+    });
+
+    const j = await safeJson(resp);
+    const sid = j?.sid ? String(j.sid) : "";
+    return sid;
+  } catch (e) {
+    logger.warn("Twilio startRecording failed", { callSid, error: String(e) });
+    return "";
+  }
+}
+
+function twilioPublicRecordingUrl(recordingSid) {
+  if (!recordingSid) return "";
+  const baseUrl = safeStr(env.PUBLIC_BASE_URL) || "";
+  if (!baseUrl) return "";
+  // your server already can expose /recordings/:sid publicly (or you can add it later);
+  // we keep the contract stable.
+  return `${baseUrl.replace(/\/+$/, "")}/recordings/${recordingSid}`;
+}
+
+async function twilioHangup(callSid) {
+  if (!callSid) return;
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) return;
+
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+      env.TWILIO_ACCOUNT_SID
+    )}/Calls/${encodeURIComponent(callSid)}.json`;
+
+    const body = new URLSearchParams();
+    body.set("Status", "completed");
+
+    await fetch(url, {
+      method: "POST",
+      headers: {
+        authorization:
+          "Basic " +
+          Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64"),
+        "content-type": "application/x-www-form-urlencoded"
+      },
+      body
+    });
+  } catch (e) {
+    logger.warn("Twilio hangup failed", { callSid, error: String(e) });
+  }
+}
+
+function shouldTriggerHangup(botText, ssot) {
+  const t = (botText || "").trim();
+  if (!t) return false;
+
+  // Fast path
+  if (t.includes("תודה") && t.includes("להתראות")) return true;
+
+  // Match explicit closers from SETTINGS
+  const settings = ssot?.settings || {};
+  const closers = Object.keys(settings)
+    .filter((k) => k.startsWith("CLOSING_"))
+    .map((k) => String(settings[k] || "").trim())
+    .filter(Boolean);
+
+  return closers.some((c) => t.startsWith(c.slice(0, Math.min(18, c.length))));
+}
+
+async function runLeadParserLLM({ ssot, transcriptText, callMeta }) {
+  if (!isTruthyEnv(env.LEAD_PARSER_ENABLED)) return null;
+
+  const prompt = safeStr(ssot?.prompts?.LEAD_PARSER_PROMPT);
+  const system = prompt || "Return JSON only. Summarize the call for CRM. No hallucinations.";
+  const key = env.GEMINI_API_KEY;
+  if (!key) return null;
+
+  // Default model for text parsing. You can override via ENV without breaking anything.
+  const model = safeStr(env.LEAD_PARSER_MODEL) || "gemini-1.5-flash";
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      model
+    )}:generateContent?key=${encodeURIComponent(key)}`;
+
+    const body = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text:
+                `SYSTEM:\n${system}\n\n` +
+                `CALL_META:\n${JSON.stringify(callMeta)}\n\n` +
+                `TRANSCRIPT:\n${transcriptText}`
+            }
+          ]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.2,
+        maxOutputTokens: 512
+      }
+    };
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+
+    const j = await safeJson(resp);
+    const txt = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
+    const trimmed = String(txt || "").trim();
+
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      return JSON.parse(trimmed);
+    }
+
+    // Some models wrap JSON in markdown; strip minimal fences.
+    const m = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (m && m[1]) {
+      const inner = m[1].trim();
+      if (inner.startsWith("{") || inner.startsWith("[")) return JSON.parse(inner);
+    }
+  } catch (e) {
+    logger.warn("LeadParser LLM failed", { error: String(e) });
+  }
+
+  return null;
+}
+
 // -----------------------------------------------------------------------------
 // Session
 // -----------------------------------------------------------------------------
@@ -180,6 +412,28 @@ class GeminiLiveSession {
     this._trBuf = { user: "", bot: "" };
     this._trLastChunk = { user: "", bot: "" };
     this._trTimer = { user: null, bot: null };
+
+    // Stage4 call state
+    const callerInfo = normalizeCallerId(this.meta?.caller || "");
+    this._call = {
+      callSid: safeStr(this.meta?.callSid),
+      streamSid: safeStr(this.meta?.streamSid),
+      source: safeStr(this.meta?.source) || "VoiceBot_Blank",
+      caller_raw: callerInfo.value,
+      caller_withheld: callerInfo.withheld,
+      called: safeStr(this.meta?.called),
+      started_at: nowIso(),
+      ended_at: null,
+      duration_ms: 0,
+      name: "",
+      has_request: false,
+      callback_number: callerInfo.withheld ? "" : callerInfo.value,
+      transcript: [],
+      recordingSid: "",
+      recording_url_public: "",
+      closing_initiated: false,
+      finalized: false
+    };
   }
 
   start() {
@@ -188,8 +442,29 @@ class GeminiLiveSession {
     const url = liveWsUrl();
     this.ws = new WebSocket(url);
 
-    this.ws.on("open", () => {
+    this.ws.on("open", async () => {
       logger.info("Gemini Live WS connected", this.meta);
+
+      // Stage4: CALL_LOG at start (optional)
+      if (isTruthyEnv(env.CALL_LOG_AT_START ?? true)) {
+        await deliverWebhookDirect("CALL_LOG", {
+          event: "CALL_LOG",
+          phase: "start",
+          call: {
+            callSid: this._call.callSid,
+            streamSid: this._call.streamSid,
+            caller: this._call.caller_raw,
+            called: this._call.called,
+            source: this._call.source,
+            started_at: this._call.started_at,
+            caller_withheld: this._call.caller_withheld
+          }
+        });
+      }
+
+      // Stage4: start recording (best-effort)
+      this._call.recordingSid = await twilioStartRecording(this._call.callSid);
+      this._call.recording_url_public = twilioPublicRecordingUrl(this._call.recordingSid);
 
       const systemText = buildSystemInstructionFromSSOT(this.ssot);
 
@@ -277,7 +552,7 @@ class GeminiLiveSession {
           const t = p?.text;
           if (t && this.onGeminiText) this.onGeminiText(String(t));
         }
-      } catch {}
+      } catch { /* ignore */ }
 
       // Transcriptions (aggregated)
       try {
@@ -286,10 +561,10 @@ class GeminiLiveSession {
 
         const outTr = msg?.serverContent?.outputTranscription?.text;
         if (outTr) this._onTranscriptChunk("bot", String(outTr));
-      } catch {}
+      } catch { /* ignore */ }
     });
 
-    this.ws.on("close", (code, reasonBuf) => {
+    this.ws.on("close", async (code, reasonBuf) => {
       const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
       this.closed = true;
       this.ready = false;
@@ -299,6 +574,9 @@ class GeminiLiveSession {
       this._flushTranscript("bot");
 
       logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
+
+      // Stage4: ensure finalize even if Twilio closes WS unexpectedly
+      await this._finalizeOnce("ws_close");
     });
 
     this.ws.on("error", (err) => {
@@ -312,7 +590,7 @@ class GeminiLiveSession {
     const c = chunk || "";
     if (!c) return;
 
-    // Ignore exact duplicates (you had lots of duplicates)
+    // Ignore exact duplicates
     if (c === this._trLastChunk[who]) return;
     this._trLastChunk[who] = c;
 
@@ -336,10 +614,9 @@ class GeminiLiveSession {
     this._trBuf[who] = "";
     if (!text) return;
 
-    // ✅ Hebrew Normalization + light NLP (deterministic)
+    // Hebrew Normalization + light NLP (deterministic)
     const nlp = normalizeUtterance(text);
 
-    // Keep existing log line for readability, but add normalized fields (non-breaking)
     logger.info(`UTTERANCE ${who}`, {
       ...this.meta,
       text: nlp.raw,
@@ -347,7 +624,7 @@ class GeminiLiveSession {
       lang: nlp.lang
     });
 
-    // ✅ Keep deterministic intent log as in Stage2 (but use normalized text)
+    // Deterministic intent log (use normalized)
     if (who === "user") {
       const intent = detectIntent({
         text: nlp.normalized || nlp.raw,
@@ -363,7 +640,48 @@ class GeminiLiveSession {
       });
     }
 
-    // Backward-compatible callback (object form as before)
+    // Stage4: accumulate transcript + LeadGate
+    try {
+      this._call.transcript.push({
+        who,
+        text: nlp.raw,
+        normalized: nlp.normalized,
+        lang: nlp.lang,
+        ts: nowIso()
+      });
+
+      if (who === "user") {
+        // Capture name early
+        if (!this._call.name) {
+          const name = extractNameHe(nlp.normalized || nlp.raw);
+          if (name) this._call.name = name;
+        } else {
+          // After name exists, mark that caller has a request
+          const body = (nlp.normalized || nlp.raw || "").trim();
+          if (body.length >= 6) this._call.has_request = true;
+
+          // Capture callback number if caller withheld
+          if (this._call.caller_withheld && !this._call.callback_number) {
+            const phone = extractPhone(nlp.normalized || nlp.raw);
+            if (phone) this._call.callback_number = phone;
+          }
+        }
+      }
+
+      if (who === "bot") {
+        // Proactive hangup after closing
+        if (!this._call.closing_initiated && shouldTriggerHangup(nlp.raw, this.ssot)) {
+          this._call.closing_initiated = true;
+          setTimeout(() => {
+            twilioHangup(this._call.callSid).catch(() => {});
+          }, 900);
+        }
+      }
+    } catch (e) {
+      logger.debug("Stage4 transcript accumulation failed", { error: String(e) });
+    }
+
+    // Backward-compatible callback
     if (this.onTranscript) this.onTranscript({ who, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang });
   }
 
@@ -416,14 +734,86 @@ class GeminiLiveSession {
     if (!this.ws || this.closed) return;
     try {
       this.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
-    } catch {}
+    } catch { /* ignore */ }
+  }
+
+  async _finalizeOnce(reason) {
+    if (this._call.finalized) return;
+    this._call.finalized = true;
+
+    try {
+      this._call.ended_at = nowIso();
+      this._call.duration_ms = Date.now() - new Date(this._call.started_at).getTime();
+
+      const transcriptText = this._call.transcript
+        .map((x) => `${String(x.who || "").toUpperCase()}: ${x.text}`)
+        .join("\n");
+
+      const leadComplete = Boolean(this._call.name && this._call.has_request);
+      const eventType = leadComplete ? "FINAL" : "ABANDONED";
+
+      const callMeta = {
+        callSid: this._call.callSid,
+        streamSid: this._call.streamSid,
+        caller: this._call.caller_raw,
+        called: this._call.called,
+        source: this._call.source,
+        started_at: this._call.started_at,
+        ended_at: this._call.ended_at,
+        duration_ms: this._call.duration_ms,
+        caller_withheld: this._call.caller_withheld,
+        recording_provider: this._call.recordingSid ? "twilio" : "",
+        recording_sid: this._call.recordingSid || "",
+        recording_url_public: this._call.recording_url_public || "",
+        finalize_reason: reason || ""
+      };
+
+      // optional: use passiveCallContext if present (non-breaking)
+      if (passiveCallContext?.buildPassiveContext) {
+        try {
+          callMeta.passive_context = passiveCallContext.buildPassiveContext({
+            meta: this.meta,
+            ssot: this.ssot
+          });
+        } catch { /* ignore */ }
+      }
+
+      // CALL_LOG at end (optional) so you get duration even if you keep start log
+      if (isTruthyEnv(env.CALL_LOG_AT_END ?? true)) {
+        await deliverWebhookDirect("CALL_LOG", { event: "CALL_LOG", phase: "end", call: callMeta });
+      }
+
+      let leadParser = null;
+      if (leadComplete && safeStr(env.LEAD_PARSER_MODE || "postcall") === "postcall") {
+        leadParser = await runLeadParserLLM({ ssot: this.ssot, transcriptText, callMeta });
+      }
+
+      const payload = {
+        event: eventType,
+        call: callMeta,
+        lead: {
+          name: this._call.name || "",
+          phone: this._call.callback_number || "",
+          notes: transcriptText,
+          lead_parser: leadParser
+        }
+      };
+
+      await deliverWebhookDirect(eventType, payload);
+    } catch (e) {
+      logger.warn("Finalize failed", { error: String(e) });
+    }
   }
 
   stop() {
+    // Stage4: finalize first, then close Gemini WS.
+    // This is intentionally "best effort" and must NOT block call teardown.
+    this._finalizeOnce("stop_called").catch(() => {});
+
     if (!this.ws) return;
     try {
       this.ws.close();
-    } catch {}
+    } catch { /* ignore */ }
   }
 }
 
