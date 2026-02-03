@@ -1,38 +1,32 @@
-// src/server.js
 "use strict";
 
 const express = require("express");
 const { env } = require("./config/env");
 const { logger } = require("./utils/logger");
-const { healthRouter } = require("./routes/health");
-const { adminReloadRouter } = require("./routes/adminReloadSheets");
-const { loadSSOT } = require("./ssot/ssotClient");
+
 const { installTwilioMediaWs } = require("./ws/twilioMediaWs");
+const { proxyRecordingMp3 } = require("./utils/twilioRecording");
+
+const healthRouter = require("./routes/health");
+const twilioStatusRouter = require("./routes/twilioStatus");
+const adminReloadRouter = require("./routes/adminReloadSheets");
 
 const app = express();
+app.use(express.json({ limit: "2mb" }));
 
-app.use(express.json({ limit: "1mb" }));
+app.get("/", (_req, res) => res.status(200).send("OK"));
 
 app.use(healthRouter);
+app.use(twilioStatusRouter);
 app.use(adminReloadRouter);
 
-app.use((req, res) => {
-  res.status(404).json({ error: "not_found" });
+// Public recording proxy (uses Twilio Basic Auth on the server side)
+app.get("/recordings/:recordingSid.mp3", proxyRecordingMp3);
+
+// WS endpoint for Twilio Media Streams
+installTwilioMediaWs(app);
+
+const port = Number(env.PORT || 3000);
+app.listen(port, () => {
+  logger.info(`Server listening on ${port}`, { port });
 });
-
-const server = app.listen(env.PORT, async () => {
-  logger.info("Service started", {
-    port: env.PORT,
-    provider_mode: env.PROVIDER_MODE
-  });
-
-  // Best-effort preload SSOT
-  try {
-    await loadSSOT(false);
-  } catch (err) {
-    logger.error("SSOT preload failed", { error: err.message });
-  }
-});
-
-// IMPORTANT: attach WS upgrade handler to the real HTTP server
-installTwilioMediaWs(server);
