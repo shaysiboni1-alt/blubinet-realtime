@@ -180,14 +180,28 @@ function normalizeCallerId(caller) {
 }
 
 function extractNameHe(text) {
-  const t = (text || "").trim();
-  if (!t) return "";
-  // "קוראים לי X", "השם שלי (זה) X", "שמי X", "אני X"
-  const m = t.match(/(?:קוראים לי|השם שלי(?: זה)?|שמי|אני)\s+([^\n,.!?]{2,40})/);
-  if (m && m[1]) return m[1].trim();
-  // fallback: short token without digits
-  if (t.length <= 25 && !t.match(/[0-9]/)) return t.replace(/^אה+[, ]*/g, "").trim();
-  return "";
+  const t0 = (text || "").trim();
+  if (!t0) return "";
+
+  const t = t0.replace(/[\u200f\u200e]/g, "").replace(/\s+/g, " ").trim();
+
+  // Avoid false positives: if it's clearly a request, not a name.
+  const bad = /(אני\s*רוצה|צריך|מבקש|תשלח|דוחות|רווח|הפסד|מס\s*הכנסה|בעיה|תקלה|שירות|מחיר|הצעה)/;
+  if (bad.test(t)) return "";
+
+  const m1 = t.match(/(?:קוראים לי|השם שלי(?: זה)?|שמי|אני)\s+([^\n,.!?]{2,40})/);
+  const candidate = (m1 && m1[1] ? m1[1] : t).trim();
+
+  let c = candidate.replace(/["'“”‘’]/g, "").replace(/[()\[\]{}]/g, "").trim();
+  c = c.replace(/^(אה+|אממ+|אז|טוב)[, ]*/g, "").trim();
+  c = c.replace(/[,.!?]+$/g, "").trim();
+
+  if (!/^[A-Za-z\u0590-\u05FF ]{2,40}$/.test(c)) return "";
+  const parts = c.split(" ").filter(Boolean);
+  if (parts.length > 3) return "";
+  if (parts.some((p) => p.length < 2 || p.length > 20)) return "";
+
+  return c;
 }
 
 function extractPhone(text) {
@@ -387,6 +401,46 @@ async function runLeadParserLLM({ ssot, transcriptText, callMeta }) {
   }
 
   return null;
+}
+function buildDeterministicLeadSummary({ transcriptItems, callMeta, state }) {
+  const items = Array.isArray(transcriptItems) ? transcriptItems : [];
+
+  const userUtterances = items
+    .filter((x) => (x.who || x.role) === "user")
+    .map((x) => (x.normalized || x.text || "").trim())
+    .filter(Boolean);
+
+  // Remove the first utterance if it seems to be just the name
+  const cleaned = userUtterances.filter((u, i) => {
+    const s = u.replace(/[,.!?]+$/g, "").trim();
+    if (i === 0 && state?.name && s.includes(state.name)) return false;
+    if (s.length <= 2) return false;
+    return true;
+  });
+
+  const request = cleaned.join(" ").replace(/\s+/g, " ").trim();
+
+  return {
+    summary: request.slice(0, 260),
+    request: request.slice(0, 260),
+    callback_number: safeStr(state?.callback_number) || "",
+    caller_withheld: Boolean(state?.caller_withheld),
+    intent_last: safeStr(state?.intent_last),
+    meta: {
+      callSid: safeStr(callMeta?.callSid),
+      started_at: safeStr(callMeta?.started_at),
+      ended_at: safeStr(callMeta?.ended_at)
+    }
+  };
+}
+
+function buildLeadNotes(summaryObj) {
+  const parts = [];
+  const req = safeStr(summaryObj?.request || summaryObj?.summary);
+  if (req) parts.push(`פנייה: ${req}`);
+  const cb = safeStr(summaryObj?.callback_number);
+  if (cb) parts.push(`חזרה למספר: ${cb}`);
+  return parts.join(" | ").trim();
 }
 
 // -----------------------------------------------------------------------------
@@ -779,27 +833,38 @@ class GeminiLiveSession {
       }
 
       // CALL_LOG at end (optional) so you get duration even if you keep start log
-      if (isTruthyEnv(env.CALL_LOG_AT_END ?? true)) {
+      if (isTruthyEnv(env.CALL_LOG_AT_END ?? false)) {
         await deliverWebhookDirect("CALL_LOG", { event: "CALL_LOG", phase: "end", call: callMeta });
       }
 
       let leadParser = null;
       if (leadComplete && safeStr(env.LEAD_PARSER_MODE || "postcall") === "postcall") {
         leadParser = await runLeadParserLLM({ ssot: this.ssot, transcriptText, callMeta });
+        if (!leadParser) {
+          leadParser = buildDeterministicLeadSummary({ transcriptItems: this.state.transcript, callMeta, state: this.state });
+        }
       }
 
-      const payload = {
-        event: eventType,
-        call: callMeta,
-        lead: {
-          name: this._call.name || "",
-          phone: this._call.callback_number || "",
-          notes: transcriptText,
-          lead_parser: leadParser
-        }
-      };
+      const summaryObj =
+  leadParser || buildDeterministicLeadSummary({ transcriptItems: this.state.transcript, callMeta, state: this.state });
 
-      await deliverWebhookDirect(eventType, payload);
+const leadNotes = buildLeadNotes(summaryObj);
+
+const payload = {
+  event: eventType,
+  call: {
+    ...callMeta,
+    ...(isTruthyEnv(env.MB_INCLUDE_TRANSCRIPT_IN_WEBHOOK ?? false) ? { transcript: transcriptText } : {})
+  },
+  lead: {
+    name: this.state.name || "",
+    phone: this.state.callback_number || "",
+    notes: leadNotes,
+    lead_parser: summaryObj
+  }
+};
+
+await deliverWebhookDirect(eventType, payload);
     } catch (e) {
       logger.warn("Finalize failed", { error: String(e) });
     }
