@@ -10,7 +10,10 @@ function nowIso() {
 }
 
 function wordsCount(s) {
-  return String(s || "").trim().split(/\s+/).filter(Boolean).length;
+  return String(s || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
 }
 
 function safeStr(v) {
@@ -18,15 +21,15 @@ function safeStr(v) {
 }
 
 function computeLeadGate(lead) {
-  const name = safeStr(lead.full_name);
-  const subject = safeStr(lead.subject);
-  const phone = safeStr(lead.callback_to_number);
+  const name = safeStr(lead?.full_name);
+  const subject = safeStr(lead?.subject);
+  const phone = safeStr(lead?.callback_to_number);
 
   if (!name || name.length < 2) {
     return { ok: false, reason: "missing_name" };
   }
 
-  const minWords = Number(lead.subject_min_words || 3);
+  const minWords = Number(lead?.subject_min_words || 3);
   if (!subject || wordsCount(subject) < minWords) {
     return { ok: false, reason: "missing_subject" };
   }
@@ -41,13 +44,7 @@ function computeLeadGate(lead) {
 /**
  * finalizeCall – SINGLE SOURCE OF TRUTH
  */
-async function finalizeCall({
-  reason,
-  callState,
-  env,
-  logger,
-  senders
-}) {
+async function finalizeCall({ reason, callState, env, logger, senders }) {
   // ------------------------------------------------------------
   // 0. Guard – run exactly once
   // ------------------------------------------------------------
@@ -63,8 +60,7 @@ async function finalizeCall({
   const endedAt = nowIso();
   callState.ended_at = endedAt;
 
-  const durationMs =
-    Date.now() - new Date(callState.started_at).getTime();
+  const durationMs = Date.now() - new Date(callState.started_at).getTime();
 
   // ------------------------------------------------------------
   // 2. Resolve recording (best-effort, blocking)
@@ -75,7 +71,7 @@ async function finalizeCall({
     recording_url_public: ""
   };
 
-  if (env.MB_ENABLE_RECORDING && senders?.resolveRecording) {
+  if (env?.MB_ENABLE_RECORDING && senders?.resolveRecording) {
     try {
       const r = await senders.resolveRecording();
       if (r && typeof r === "object") {
@@ -93,7 +89,7 @@ async function finalizeCall({
   // ------------------------------------------------------------
   // 3. LeadGate – deterministic decision
   // ------------------------------------------------------------
-  const gate = computeLeadGate(callState.lead);
+  const gate = computeLeadGate(callState.lead || {});
 
   // ------------------------------------------------------------
   // 4. Build base payload
@@ -118,7 +114,7 @@ async function finalizeCall({
     },
 
     lead: {
-      ...callState.lead,
+      ...(callState.lead || {}),
       decision_reason: gate.reason
     },
 
@@ -171,4 +167,16 @@ async function finalizeCall({
   }
 }
 
-module.exports = { finalizePipeline: finalizeCall };
+/**
+ * finalizePipeline – compatibility wrapper
+ * geminiLiveSession.js calls finalizePipeline(...)
+ */
+async function finalizePipeline(args) {
+  return finalizeCall(args);
+}
+
+module.exports = {
+  finalizePipeline,
+  finalizeCall,
+  computeLeadGate
+};
