@@ -6,6 +6,7 @@ const { logger } = require("../utils/logger");
 const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
 const { detectIntent } = require("../logic/intentRouter");
 const { normalizeUtterance } = require("../logic/hebrewNlp");
+const { finalizePipeline } = require("../stage4/finalizePipeline");
 
 // Optional (exists in your repo). We use it if present, but do not depend on it for core flow.
 let passiveCallContext = null;
@@ -15,7 +16,7 @@ try {
 } catch { /* ignore */ }
 
 // -----------------------------------------------------------------------------
-// Helpers (non-breaking, Stage4 additions are isolated)
+// Helpers (baseline-safe)
 // -----------------------------------------------------------------------------
 
 function normalizeModelName(m) {
@@ -182,10 +183,8 @@ function normalizeCallerId(caller) {
 function extractNameHe(text) {
   const t = (text || "").trim();
   if (!t) return "";
-  // "קוראים לי X", "השם שלי (זה) X", "שמי X", "אני X"
   const m = t.match(/(?:קוראים לי|השם שלי(?: זה)?|שמי|אני)\s+([^\n,.!?]{2,40})/);
   if (m && m[1]) return m[1].trim();
-  // fallback: short token without digits
   if (t.length <= 25 && !t.match(/[0-9]/)) return t.replace(/^אה+[, ]*/g, "").trim();
   return "";
 }
@@ -215,28 +214,20 @@ async function safeJson(resp) {
 }
 
 // -----------------------------------------------------------------------------
-// Stage4: Webhooks + Recording + LeadGate + Post-call LeadParser
-// (Implemented inside the session to avoid touching ws/twilioMediaWs.js)
+// Stage4 dependencies (safe, best-effort)
 // -----------------------------------------------------------------------------
 
-async function deliverWebhookDirect(eventType, payload) {
-  const map = {
-    CALL_LOG: env.CALL_LOG_WEBHOOK_URL,
-    FINAL: env.FINAL_WEBHOOK_URL,
-    ABANDONED: env.ABANDONED_WEBHOOK_URL
-  };
-  const url = map[eventType];
+async function deliverWebhook(url, payload, label) {
   if (!url) return;
-
   try {
     const resp = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload)
     });
-    logger.info("Webhook delivered", { eventType, status: resp.status, attempt: 1 });
+    logger.info("Webhook delivered", { label, status: resp.status });
   } catch (e) {
-    logger.warn("Webhook delivery failed", { eventType, error: String(e) });
+    logger.warn("Webhook delivery failed", { label, error: String(e) });
   }
 }
 
@@ -265,8 +256,7 @@ async function twilioStartRecording(callSid) {
     });
 
     const j = await safeJson(resp);
-    const sid = j?.sid ? String(j.sid) : "";
-    return sid;
+    return j?.sid ? String(j.sid) : "";
   } catch (e) {
     logger.warn("Twilio startRecording failed", { callSid, error: String(e) });
     return "";
@@ -277,116 +267,7 @@ function twilioPublicRecordingUrl(recordingSid) {
   if (!recordingSid) return "";
   const baseUrl = safeStr(env.PUBLIC_BASE_URL) || "";
   if (!baseUrl) return "";
-  // your server already can expose /recordings/:sid publicly (or you can add it later);
-  // we keep the contract stable.
   return `${baseUrl.replace(/\/+$/, "")}/recordings/${recordingSid}`;
-}
-
-async function twilioHangup(callSid) {
-  if (!callSid) return;
-  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) return;
-
-  try {
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
-      env.TWILIO_ACCOUNT_SID
-    )}/Calls/${encodeURIComponent(callSid)}.json`;
-
-    const body = new URLSearchParams();
-    body.set("Status", "completed");
-
-    await fetch(url, {
-      method: "POST",
-      headers: {
-        authorization:
-          "Basic " +
-          Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64"),
-        "content-type": "application/x-www-form-urlencoded"
-      },
-      body
-    });
-  } catch (e) {
-    logger.warn("Twilio hangup failed", { callSid, error: String(e) });
-  }
-}
-
-function shouldTriggerHangup(botText, ssot) {
-  const t = (botText || "").trim();
-  if (!t) return false;
-
-  // Fast path
-  if (t.includes("תודה") && t.includes("להתראות")) return true;
-
-  // Match explicit closers from SETTINGS
-  const settings = ssot?.settings || {};
-  const closers = Object.keys(settings)
-    .filter((k) => k.startsWith("CLOSING_"))
-    .map((k) => String(settings[k] || "").trim())
-    .filter(Boolean);
-
-  return closers.some((c) => t.startsWith(c.slice(0, Math.min(18, c.length))));
-}
-
-async function runLeadParserLLM({ ssot, transcriptText, callMeta }) {
-  if (!isTruthyEnv(env.LEAD_PARSER_ENABLED)) return null;
-
-  const prompt = safeStr(ssot?.prompts?.LEAD_PARSER_PROMPT);
-  const system = prompt || "Return JSON only. Summarize the call for CRM. No hallucinations.";
-  const key = env.GEMINI_API_KEY;
-  if (!key) return null;
-
-  // Default model for text parsing. You can override via ENV without breaking anything.
-  const model = safeStr(env.LEAD_PARSER_MODEL) || "gemini-1.5-flash";
-
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      model
-    )}:generateContent?key=${encodeURIComponent(key)}`;
-
-    const body = {
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text:
-                `SYSTEM:\n${system}\n\n` +
-                `CALL_META:\n${JSON.stringify(callMeta)}\n\n` +
-                `TRANSCRIPT:\n${transcriptText}`
-            }
-          ]
-        }
-      ],
-      generationConfig: {
-        temperature: 0.2,
-        maxOutputTokens: 512
-      }
-    };
-
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body)
-    });
-
-    const j = await safeJson(resp);
-    const txt = j?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
-    const trimmed = String(txt || "").trim();
-
-    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-      return JSON.parse(trimmed);
-    }
-
-    // Some models wrap JSON in markdown; strip minimal fences.
-    const m = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-    if (m && m[1]) {
-      const inner = m[1].trim();
-      if (inner.startsWith("{") || inner.startsWith("[")) return JSON.parse(inner);
-    }
-  } catch (e) {
-    logger.warn("LeadParser LLM failed", { error: String(e) });
-  }
-
-  return null;
 }
 
 // -----------------------------------------------------------------------------
@@ -405,16 +286,17 @@ class GeminiLiveSession {
     this.ws = null;
     this.ready = false;
     this.closed = false;
-
     this._greetingSent = false;
 
-    // Transcript aggregation (so logs are readable)
+    // Transcript aggregation (readability only; decision does NOT depend on it)
     this._trBuf = { user: "", bot: "" };
     this._trLastChunk = { user: "", bot: "" };
     this._trTimer = { user: null, bot: null };
 
     // Stage4 call state
     const callerInfo = normalizeCallerId(this.meta?.caller || "");
+    const subjectMinWords = Number(this.ssot?.settings?.SUBJECT_MIN_WORDS ?? 3) || 3;
+
     this._call = {
       callSid: safeStr(this.meta?.callSid),
       streamSid: safeStr(this.meta?.streamSid),
@@ -424,14 +306,22 @@ class GeminiLiveSession {
       called: safeStr(this.meta?.called),
       started_at: nowIso(),
       ended_at: null,
-      duration_ms: 0,
-      name: "",
-      has_request: false,
-      callback_number: callerInfo.withheld ? "" : callerInfo.value,
+
+      // Lead fields (decision depends ONLY on these)
+      lead: {
+        full_name: "",
+        subject: "",
+        callback_to_number: callerInfo.withheld ? "" : callerInfo.value,
+        subject_min_words: subjectMinWords
+      },
+
+      // transcript buffer for CRM parser later (not used for decision)
       transcript: [],
-      recordingSid: "",
+
+      // recording
+      recording_sid: "",
       recording_url_public: "",
-      closing_initiated: false,
+
       finalized: false
     };
   }
@@ -445,26 +335,9 @@ class GeminiLiveSession {
     this.ws.on("open", async () => {
       logger.info("Gemini Live WS connected", this.meta);
 
-      // Stage4: CALL_LOG at start (optional)
-      if (isTruthyEnv(env.CALL_LOG_AT_START ?? true)) {
-        await deliverWebhookDirect("CALL_LOG", {
-          event: "CALL_LOG",
-          phase: "start",
-          call: {
-            callSid: this._call.callSid,
-            streamSid: this._call.streamSid,
-            caller: this._call.caller_raw,
-            called: this._call.called,
-            source: this._call.source,
-            started_at: this._call.started_at,
-            caller_withheld: this._call.caller_withheld
-          }
-        });
-      }
-
-      // Stage4: start recording (best-effort)
-      this._call.recordingSid = await twilioStartRecording(this._call.callSid);
-      this._call.recording_url_public = twilioPublicRecordingUrl(this._call.recordingSid);
+      // Recording: start best-effort (must NOT affect voice)
+      this._call.recording_sid = await twilioStartRecording(this._call.callSid);
+      this._call.recording_url_public = twilioPublicRecordingUrl(this._call.recording_sid);
 
       const systemText = buildSystemInstructionFromSSOT(this.ssot);
 
@@ -569,14 +442,13 @@ class GeminiLiveSession {
       this.closed = true;
       this.ready = false;
 
-      // flush pending transcript buffers
       this._flushTranscript("user");
       this._flushTranscript("bot");
 
       logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
 
-      // Stage4: ensure finalize even if Twilio closes WS unexpectedly
-      await this._finalizeOnce("ws_close");
+      // Stage4 finalize: always best-effort, never throws outward
+      await this._finalizeOnce("gemini_ws_close");
     });
 
     this.ws.on("error", (err) => {
@@ -590,14 +462,11 @@ class GeminiLiveSession {
     const c = chunk || "";
     if (!c) return;
 
-    // Ignore exact duplicates
     if (c === this._trLastChunk[who]) return;
     this._trLastChunk[who] = c;
 
-    // Append chunk, cap size
     this._trBuf[who] = (this._trBuf[who] + c).slice(-800);
 
-    // Debounce flush so you get one readable line per utterance-ish
     if (this._trTimer[who]) clearTimeout(this._trTimer[who]);
     this._trTimer[who] = setTimeout(() => this._flushTranscript(who), 450);
   }
@@ -614,7 +483,6 @@ class GeminiLiveSession {
     this._trBuf[who] = "";
     if (!text) return;
 
-    // Hebrew Normalization + light NLP (deterministic)
     const nlp = normalizeUtterance(text);
 
     logger.info(`UTTERANCE ${who}`, {
@@ -624,7 +492,6 @@ class GeminiLiveSession {
       lang: nlp.lang
     });
 
-    // Deterministic intent log (use normalized)
     if (who === "user") {
       const intent = detectIntent({
         text: nlp.normalized || nlp.raw,
@@ -640,7 +507,7 @@ class GeminiLiveSession {
       });
     }
 
-    // Stage4: accumulate transcript + LeadGate
+    // ---- Stage4: capture lead fields deterministically (decision does NOT depend on transcript existence) ----
     try {
       this._call.transcript.push({
         who,
@@ -651,38 +518,35 @@ class GeminiLiveSession {
       });
 
       if (who === "user") {
-        // Capture name early
-        if (!this._call.name) {
-          const name = extractNameHe(nlp.normalized || nlp.raw);
-          if (name) this._call.name = name;
-        } else {
-          // After name exists, mark that caller has a request
-          const body = (nlp.normalized || nlp.raw || "").trim();
-          if (body.length >= 6) this._call.has_request = true;
+        const userText = (nlp.normalized || nlp.raw || "").trim();
 
-          // Capture callback number if caller withheld
-          if (this._call.caller_withheld && !this._call.callback_number) {
-            const phone = extractPhone(nlp.normalized || nlp.raw);
-            if (phone) this._call.callback_number = phone;
+        // 1) Name capture
+        if (!this._call.lead.full_name) {
+          const name = extractNameHe(userText);
+          if (name) this._call.lead.full_name = name;
+        } else {
+          // 2) Subject capture (first meaningful request after name)
+          if (!this._call.lead.subject) {
+            const words = userText.split(/\s+/).filter(Boolean);
+            if (words.length >= (this._call.lead.subject_min_words || 3)) {
+              this._call.lead.subject = userText;
+            }
+          }
+
+          // 3) Callback number if withheld
+          if (this._call.caller_withheld && !this._call.lead.callback_to_number) {
+            const phone = extractPhone(userText);
+            if (phone) this._call.lead.callback_to_number = phone;
           }
         }
       }
-
-      if (who === "bot") {
-        // Proactive hangup after closing
-        if (!this._call.closing_initiated && shouldTriggerHangup(nlp.raw, this.ssot)) {
-          this._call.closing_initiated = true;
-          setTimeout(() => {
-            twilioHangup(this._call.callSid).catch(() => {});
-          }, 900);
-        }
-      }
     } catch (e) {
-      logger.debug("Stage4 transcript accumulation failed", { error: String(e) });
+      logger.debug("Stage4 lead capture failed", { error: String(e) });
     }
 
-    // Backward-compatible callback
-    if (this.onTranscript) this.onTranscript({ who, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang });
+    if (this.onTranscript) {
+      this.onTranscript({ who, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang });
+    }
   }
 
   _sendProactiveOpening() {
@@ -743,14 +607,11 @@ class GeminiLiveSession {
 
     try {
       this._call.ended_at = nowIso();
-      this._call.duration_ms = Date.now() - new Date(this._call.started_at).getTime();
+      const durationMs = Date.now() - new Date(this._call.started_at).getTime();
 
       const transcriptText = this._call.transcript
         .map((x) => `${String(x.who || "").toUpperCase()}: ${x.text}`)
         .join("\n");
-
-      const leadComplete = Boolean(this._call.name && this._call.has_request);
-      const eventType = leadComplete ? "FINAL" : "ABANDONED";
 
       const callMeta = {
         callSid: this._call.callSid,
@@ -760,15 +621,12 @@ class GeminiLiveSession {
         source: this._call.source,
         started_at: this._call.started_at,
         ended_at: this._call.ended_at,
-        duration_ms: this._call.duration_ms,
+        duration_ms: durationMs,
         caller_withheld: this._call.caller_withheld,
-        recording_provider: this._call.recordingSid ? "twilio" : "",
-        recording_sid: this._call.recordingSid || "",
-        recording_url_public: this._call.recording_url_public || "",
         finalize_reason: reason || ""
       };
 
-      // optional: use passiveCallContext if present (non-breaking)
+      // optional passive context (non-breaking)
       if (passiveCallContext?.buildPassiveContext) {
         try {
           callMeta.passive_context = passiveCallContext.buildPassiveContext({
@@ -778,36 +636,37 @@ class GeminiLiveSession {
         } catch { /* ignore */ }
       }
 
-      // CALL_LOG at end (optional) so you get duration even if you keep start log
-      if (isTruthyEnv(env.CALL_LOG_AT_END ?? true)) {
-        await deliverWebhookDirect("CALL_LOG", { event: "CALL_LOG", phase: "end", call: callMeta });
-      }
-
-      let leadParser = null;
-      if (leadComplete && safeStr(env.LEAD_PARSER_MODE || "postcall") === "postcall") {
-        leadParser = await runLeadParserLLM({ ssot: this.ssot, transcriptText, callMeta });
-      }
-
-      const payload = {
-        event: eventType,
+      const snapshot = {
         call: callMeta,
         lead: {
-          name: this._call.name || "",
-          phone: this._call.callback_number || "",
-          notes: transcriptText,
-          lead_parser: leadParser
+          ...this._call.lead,
+          // Keep notes for now (you can later swap to crm_short summary in Stage4.2)
+          notes: transcriptText
         }
       };
 
-      await deliverWebhookDirect(eventType, payload);
+      await finalizePipeline({
+        snapshot,
+        env,
+        logger,
+        senders: {
+          sendCallLog: (payload) => deliverWebhook(env.CALL_LOG_WEBHOOK_URL, payload, "CALL_LOG"),
+          sendFinal: (payload) => deliverWebhook(env.FINAL_WEBHOOK_URL, payload, "FINAL"),
+          sendAbandoned: (payload) => deliverWebhook(env.ABANDONED_WEBHOOK_URL, payload, "ABANDONED"),
+          resolveRecording: async () => ({
+            recording_provider: this._call.recording_sid ? "twilio" : "",
+            recording_sid: this._call.recording_sid || "",
+            recording_url_public: this._call.recording_url_public || ""
+          })
+        }
+      });
     } catch (e) {
       logger.warn("Finalize failed", { error: String(e) });
     }
   }
 
   stop() {
-    // Stage4: finalize first, then close Gemini WS.
-    // This is intentionally "best effort" and must NOT block call teardown.
+    // Stage4: finalize (best-effort), then close Gemini WS.
     this._finalizeOnce("stop_called").catch(() => {});
 
     if (!this.ws) return;
