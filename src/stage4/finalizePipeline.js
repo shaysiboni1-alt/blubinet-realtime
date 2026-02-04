@@ -5,7 +5,7 @@
  *
  * Guarantees:
  * - Never throws (all exceptions are caught)
- * - CALL_LOG sent at most once (respects CALL_LOG_MODE + flags)
+ * - CALL_LOG sent at most once (centralized here)
  * - FINAL and ABANDONED are mutually exclusive
  * - FINAL decision does NOT depend on transcript (only on lead fields captured during the call)
  * - Recording is best-effort and must not block webhook delivery
@@ -50,24 +50,19 @@ async function finalizePipeline({ snapshot, env, senders, logger }) {
     }
   };
 
-  const callLogAtStart = truthy(env?.CALL_LOG_AT_START);
-  const callLogAtEnd = truthy(env?.CALL_LOG_AT_END);
+  // We call finalizePipeline ONLY at end-of-call. Therefore CALL_LOG is centralized here to avoid duplicates.
+  const callLogEnabled = truthy(env?.CALL_LOG_AT_START) || truthy(env?.CALL_LOG_AT_END);
   const callLogMode = String(env?.CALL_LOG_MODE || "start").trim().toLowerCase(); // start|end|both
 
-  // Decide which phase should send CALL_LOG.
   const shouldSendCallLogNow = (() => {
-    // In our implementation we call finalizePipeline at end-of-call.
-    // So:
-    // - mode=start => still send once at end (because we intentionally centralize sending in Stage4)
-    // - mode=end   => send at end
-    // - mode=both  => send once at end (dedup by design)
-    if (!(callLogAtStart || callLogAtEnd)) return false;
+    if (!callLogEnabled) return false;
     if (callLogMode === "none") return false;
+    // Centralize: send once here at end regardless of mode to avoid double-send.
     return true;
   })();
 
   if (shouldSendCallLogNow && senders?.sendCallLog) {
-    await safe(() => senders.sendCallLog(snapshot), "CALL_LOG");
+    await safe(() => senders.sendCallLog({ ...snapshot, phase: "end" }), "CALL_LOG");
   }
 
   const decision = decideLead(snapshot?.lead || {});
