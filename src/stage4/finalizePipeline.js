@@ -1,117 +1,174 @@
 "use strict";
 
 /**
- * STAGE 4 – Post-call Finalization Pipeline (isolated)
- *
- * Guarantees:
- * - Never throws (all exceptions are caught)
- * - CALL_LOG sent at most once per phase (dedup state outside or inside caller)
- * - FINAL and ABANDONED are mutually exclusive
- * - FINAL decision does NOT depend on transcript (only on lead fields captured during the call)
- * - Recording is best-effort and must not block webhook delivery
+ * Stage 4 – Canonical Call Finalization
+ * FINAL / ABANDONED decision is deterministic and transcript-independent
  */
 
-function truthy(v) {
-  const s = String(v ?? "").trim().toLowerCase();
-  return s === "true" || s === "1" || s === "yes" || s === "y";
+function nowIso() {
+  return new Date().toISOString();
 }
 
-function safeSplitWords(s) {
-  return String(s || "")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
+function wordsCount(s) {
+  return String(s || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+function safeStr(v) {
+  return v === undefined || v === null ? "" : String(v);
+}
+
+function computeLeadGate(lead) {
+  const name = safeStr(lead.full_name);
+  const subject = safeStr(lead.subject);
+  const phone = safeStr(lead.callback_to_number);
+
+  if (!name || name.length < 2) {
+    return { ok: false, reason: "missing_name" };
+  }
+
+  const minWords = Number(lead.subject_min_words || 3);
+  if (!subject || wordsCount(subject) < minWords) {
+    return { ok: false, reason: "missing_subject" };
+  }
+
+  if (!phone) {
+    return { ok: false, reason: "missing_phone" };
+  }
+
+  return { ok: true, reason: "lead_complete" };
 }
 
 /**
- * lead fields contract:
- * - full_name
- * - subject
- * - callback_to_number
- * - subject_min_words
+ * finalizeCall – SINGLE SOURCE OF TRUTH
  */
-function decideLead(lead) {
-  const fullName = String(lead?.full_name || "").trim();
-  const subject = String(lead?.subject || "").trim();
-  const cb = String(lead?.callback_to_number || "").trim();
-  const minWords = Number(lead?.subject_min_words || 3);
-
-  if (!fullName) return { type: "ABANDONED", reason: "missing_name" };
-  if (!subject || safeSplitWords(subject).length < minWords) {
-    return { type: "ABANDONED", reason: "subject_too_short" };
+async function finalizeCall({
+  reason,
+  callState,
+  env,
+  logger,
+  senders
+}) {
+  // ------------------------------------------------------------
+  // 0. Guard – run exactly once
+  // ------------------------------------------------------------
+  if (callState.finalized) {
+    logger?.debug?.("finalizeCall: already finalized");
+    return;
   }
-  if (!cb) return { type: "ABANDONED", reason: "missing_callback" };
+  callState.finalized = true;
 
-  return { type: "FINAL", reason: "lead_complete" };
-}
+  // ------------------------------------------------------------
+  // 1. Close timing
+  // ------------------------------------------------------------
+  const endedAt = nowIso();
+  callState.ended_at = endedAt;
 
-async function finalizePipeline({ snapshot, env, senders, logger, state }) {
-  const log = logger || console;
+  const durationMs =
+    Date.now() - new Date(callState.started_at).getTime();
 
-  const safe = async (fn, label) => {
+  // ------------------------------------------------------------
+  // 2. Resolve recording (best-effort, blocking)
+  // ------------------------------------------------------------
+  let recording = {
+    recording_provider: "",
+    recording_sid: "",
+    recording_url_public: ""
+  };
+
+  if (env.MB_ENABLE_RECORDING && senders?.resolveRecording) {
     try {
-      return await fn();
-    } catch (err) {
-      log?.warn?.(`[STAGE4:${label}] failed`, { error: err?.message || String(err) });
-      return null;
-    }
-  };
-
-  // local state to dedup (optional external state can also be passed)
-  const st = state || {
-    callLogSentStart: false,
-    callLogSentEnd: false
-  };
-
-  const callLogAtStart = truthy(env?.CALL_LOG_AT_START);
-  const callLogAtEnd = truthy(env?.CALL_LOG_AT_END);
-  const callLogMode = String(env?.CALL_LOG_MODE || "start").trim().toLowerCase(); // start|end|both
-
-  const wantStart = (callLogMode === "start" || callLogMode === "both") && callLogAtStart;
-  const wantEnd = (callLogMode === "end" || callLogMode === "both") && callLogAtEnd;
-
-  // NOTE: finalizePipeline is called at end-of-call.
-  // If mode=start בלבד, אנחנו עדיין שולחים CALL_LOG "start" כאן (כי ריכזנו את השליחה לסוף),
-  // אבל בצורה דטרמיניסטית ובדיוק פעם אחת.
-  // אם תרצה בעתיד “אמיתי start בזמן חיבור” – נעשה זאת ב-ws בלי לשבור קול.
-  const phaseToSend =
-    wantEnd ? "end" : (wantStart ? "start" : null);
-
-  if (phaseToSend && senders?.sendCallLog) {
-    const already =
-      phaseToSend === "start" ? st.callLogSentStart : st.callLogSentEnd;
-
-    if (!already) {
-      if (phaseToSend === "start") st.callLogSentStart = true;
-      else st.callLogSentEnd = true;
-
-      await safe(() => senders.sendCallLog({ ...snapshot, phase: phaseToSend }), "CALL_LOG");
+      const r = await senders.resolveRecording();
+      if (r && typeof r === "object") {
+        recording = {
+          recording_provider: safeStr(r.recording_provider),
+          recording_sid: safeStr(r.recording_sid),
+          recording_url_public: safeStr(r.recording_url_public)
+        };
+      }
+    } catch (e) {
+      logger?.warn?.("Recording resolve failed", { error: String(e) });
     }
   }
 
-  const decision = decideLead(snapshot?.lead || {});
+  // ------------------------------------------------------------
+  // 3. LeadGate – deterministic decision
+  // ------------------------------------------------------------
+  const gate = computeLeadGate(callState.lead);
 
-  // Recording – best effort
-  const recording = senders?.resolveRecording
-    ? await safe(() => senders.resolveRecording(snapshot), "RECORDING")
-    : null;
-
+  // ------------------------------------------------------------
+  // 4. Build base payload
+  // ------------------------------------------------------------
   const basePayload = {
-    call: snapshot?.call || {},
-    lead: snapshot?.lead || {},
-    decision_reason: decision.reason,
-    recording_provider: recording?.recording_provider || "",
-    recording_sid: recording?.recording_sid || "",
-    recording_url_public: recording?.recording_url_public || ""
+    event: null,
+
+    call: {
+      callSid: callState.callSid,
+      streamSid: callState.streamSid,
+      caller: callState.caller,
+      called: callState.called,
+      source: callState.source,
+
+      caller_withheld: !!callState.caller_withheld,
+
+      started_at: callState.started_at,
+      ended_at: endedAt,
+      duration_ms: durationMs,
+
+      finalize_reason: safeStr(reason)
+    },
+
+    lead: {
+      ...callState.lead,
+      decision_reason: gate.reason
+    },
+
+    recording_provider: recording.recording_provider,
+    recording_sid: recording.recording_sid,
+    recording_url_public: recording.recording_url_public
   };
 
-  if (decision.type === "FINAL" && senders?.sendFinal) {
-    await safe(() => senders.sendFinal({ event: "FINAL", ...basePayload }), "FINAL");
-  } else if (decision.type === "ABANDONED" && senders?.sendAbandoned) {
-    await safe(() => senders.sendAbandoned({ event: "ABANDONED", ...basePayload }), "ABANDONED");
+  // ------------------------------------------------------------
+  // 5. CALL_LOG – always
+  // ------------------------------------------------------------
+  try {
+    if (senders?.sendCallLog) {
+      await senders.sendCallLog({
+        ...basePayload,
+        event: "CALL_LOG"
+      });
+    }
+  } catch (e) {
+    logger?.warn?.("CALL_LOG webhook failed", { error: String(e) });
   }
 
-  return { finalized: true, decision: decision.type, reason: decision.reason };
+  // ------------------------------------------------------------
+  // 6. FINAL xor ABANDONED
+  // ------------------------------------------------------------
+  if (gate.ok) {
+    // FINAL
+    try {
+      if (senders?.sendFinal) {
+        await senders.sendFinal({
+          ...basePayload,
+          event: "FINAL"
+        });
+      }
+    } catch (e) {
+      logger?.warn?.("FINAL webhook failed", { error: String(e) });
+    }
+  } else {
+    // ABANDONED
+    try {
+      if (senders?.sendAbandoned) {
+        await senders.sendAbandoned({
+          ...basePayload,
+          event: "ABANDONED"
+        });
+      }
+    } catch (e) {
+      logger?.warn?.("ABANDONED webhook failed", { error: String(e) });
+    }
+  }
 }
 
-module.exports = { finalizePipeline, decideLead };
+module.exports = { finalizeCall };
