@@ -6,7 +6,7 @@ const { logger } = require("../utils/logger");
 const { ulaw8kB64ToPcm16kB64, pcm24kB64ToUlaw8kB64 } = require("./twilioGeminiAudio");
 const { detectIntent } = require("../logic/intentRouter");
 const { normalizeUtterance } = require("../logic/hebrewNlp");
-const { finalizePipeline } = require("../stage4/finalizePipeline");
+const { finalizePipeline } = require("../logic/finalizePipeline");
 
 // Optional (exists in your repo). We use it if present, but do not depend on it for core flow.
 let passiveCallContext = null;
@@ -16,8 +16,22 @@ try {
 } catch { /* ignore */ }
 
 // -----------------------------------------------------------------------------
-// Helpers (baseline-safe)
+// Helpers
 // -----------------------------------------------------------------------------
+
+function truthy(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes" || s === "y";
+}
+
+function safeStr(x) {
+  if (x === undefined || x === null) return "";
+  return String(x).trim();
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
 
 function normalizeModelName(m) {
   if (!m) return "";
@@ -31,11 +45,6 @@ function liveWsUrl() {
   return `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
     key
   )}`;
-}
-
-function safeStr(x) {
-  if (x === undefined || x === null) return "";
-  return String(x).trim();
 }
 
 function applyTemplate(tpl, vars) {
@@ -55,7 +64,6 @@ function buildSettingsContext(settings) {
 
 function buildIntentsContext(intents) {
   const rows = Array.isArray(intents) ? intents.slice() : [];
-
   rows.sort((a, b) => {
     const pa = Number(a?.priority ?? 0);
     const pb = Number(b?.priority ?? 0);
@@ -165,15 +173,11 @@ function getOpeningScriptFromSSOT(ssot, vars) {
   return filled || "שלום! איך נוכל לעזור?";
 }
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
 function normalizeCallerId(caller) {
   const s = (caller || "").trim();
   const low = s.toLowerCase();
   if (!s) return { value: "", withheld: true };
-  if (low === "anonymous" || low === "restricted" || low === "unavailable" || low === "unknown") {
+  if (low === "anonymous" || low === "restricted" || low === "unavailable" || low === "unknown" || low === "private") {
     return { value: s, withheld: true };
   }
   const digits = s.replace(/\D/g, "");
@@ -183,9 +187,24 @@ function normalizeCallerId(caller) {
 function extractNameHe(text) {
   const t = (text || "").trim();
   if (!t) return "";
+
+  // If user says only the "prefix" without a name -> reject.
+  const pseudo = new Set(["השם שלי", "שמי", "אני", "קוראים לי", "השם שלי זה"]);
+  if (pseudo.has(t)) return "";
+
+  // "קוראים לי X", "השם שלי (זה) X", "שמי X", "אני X"
   const m = t.match(/(?:קוראים לי|השם שלי(?: זה)?|שמי|אני)\s+([^\n,.!?]{2,40})/);
-  if (m && m[1]) return m[1].trim();
-  if (t.length <= 25 && !t.match(/[0-9]/)) return t.replace(/^אה+[, ]*/g, "").trim();
+  if (m && m[1]) {
+    const cand = m[1].trim();
+    if (pseudo.has(cand)) return "";
+    if (cand.length >= 2 && cand.length <= 40 && !cand.match(/[0-9]/)) return cand;
+  }
+
+  // fallback: if it's short and looks like a name (Hebrew/letters, not just generic words)
+  if (t.length <= 20 && !t.match(/[0-9]/)) {
+    if (t.match(/^[\p{L}][\p{L}\s'’-]{1,19}$/u) && !pseudo.has(t)) return t;
+  }
+
   return "";
 }
 
@@ -200,11 +219,6 @@ function extractPhone(text) {
   return "";
 }
 
-function isTruthyEnv(v) {
-  const s = String(v ?? "").trim().toLowerCase();
-  return s === "true" || s === "1" || s === "yes" || s === "y";
-}
-
 async function safeJson(resp) {
   try {
     return await resp.json();
@@ -214,10 +228,10 @@ async function safeJson(resp) {
 }
 
 // -----------------------------------------------------------------------------
-// Stage4 dependencies (safe, best-effort)
+// Webhooks (direct)
 // -----------------------------------------------------------------------------
 
-async function deliverWebhook(url, payload, label) {
+async function deliverWebhookDirect(label, url, payload) {
   if (!url) return;
   try {
     const resp = await fetch(url, {
@@ -231,10 +245,23 @@ async function deliverWebhook(url, payload, label) {
   }
 }
 
+// -----------------------------------------------------------------------------
+// Twilio Recording (best-effort + resolve)
+// -----------------------------------------------------------------------------
+
+function twilioAuthHeader() {
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) return "";
+  return (
+    "Basic " +
+    Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64")
+  );
+}
+
 async function twilioStartRecording(callSid) {
   if (!callSid) return "";
-  if (!isTruthyEnv(env.MB_ENABLE_RECORDING)) return "";
-  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN) return "";
+  if (!truthy(env.MB_ENABLE_RECORDING)) return "";
+  const auth = twilioAuthHeader();
+  if (!auth) return "";
 
   try {
     const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
@@ -242,438 +269,28 @@ async function twilioStartRecording(callSid) {
     )}/Calls/${encodeURIComponent(callSid)}/Recordings.json`;
 
     const body = new URLSearchParams();
-    body.set("RecordingStatusCallbackEvent", "completed");
+    // Minimal: start recording now
+    body.set("RecordingChannels", "dual");
 
     const resp = await fetch(url, {
       method: "POST",
       headers: {
-        authorization:
-          "Basic " +
-          Buffer.from(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`).toString("base64"),
+        authorization: auth,
         "content-type": "application/x-www-form-urlencoded"
       },
       body
     });
 
     const j = await safeJson(resp);
-    return j?.sid ? String(j.sid) : "";
+    const sid = j?.sid ? String(j.sid) : "";
+    logger.info("Twilio recording start", { callSid, status: resp.status, recordingSid: sid || "" });
+    return sid;
   } catch (e) {
     logger.warn("Twilio startRecording failed", { callSid, error: String(e) });
     return "";
   }
 }
 
-function twilioPublicRecordingUrl(recordingSid) {
-  if (!recordingSid) return "";
-  const baseUrl = safeStr(env.PUBLIC_BASE_URL) || "";
-  if (!baseUrl) return "";
-  return `${baseUrl.replace(/\/+$/, "")}/recordings/${recordingSid}`;
-}
-
-// -----------------------------------------------------------------------------
-// Session
-// -----------------------------------------------------------------------------
-
-class GeminiLiveSession {
-  constructor({ onGeminiAudioUlaw8kBase64, onGeminiText, onTranscript, meta, ssot }) {
-    this.onGeminiAudioUlaw8kBase64 = onGeminiAudioUlaw8kBase64;
-    this.onGeminiText = onGeminiText;
-    this.onTranscript = onTranscript;
-
-    this.meta = meta || {};
-    this.ssot = ssot || {};
-
-    this.ws = null;
-    this.ready = false;
-    this.closed = false;
-    this._greetingSent = false;
-
-    // Transcript aggregation (readability only; decision does NOT depend on it)
-    this._trBuf = { user: "", bot: "" };
-    this._trLastChunk = { user: "", bot: "" };
-    this._trTimer = { user: null, bot: null };
-
-    // Stage4 call state
-    const callerInfo = normalizeCallerId(this.meta?.caller || "");
-    const subjectMinWords = Number(this.ssot?.settings?.SUBJECT_MIN_WORDS ?? 3) || 3;
-
-    this._call = {
-      callSid: safeStr(this.meta?.callSid),
-      streamSid: safeStr(this.meta?.streamSid),
-      source: safeStr(this.meta?.source) || "VoiceBot_Blank",
-      caller_raw: callerInfo.value,
-      caller_withheld: callerInfo.withheld,
-      called: safeStr(this.meta?.called),
-      started_at: nowIso(),
-      ended_at: null,
-
-      // Lead fields (decision depends ONLY on these)
-      lead: {
-        full_name: "",
-        subject: "",
-        callback_to_number: callerInfo.withheld ? "" : callerInfo.value,
-        subject_min_words: subjectMinWords
-      },
-
-      // transcript buffer for CRM parser later (not used for decision)
-      transcript: [],
-
-      // recording
-      recording_sid: "",
-      recording_url_public: "",
-
-      finalized: false
-    };
-  }
-
-  start() {
-    if (this.ws) return;
-
-    const url = liveWsUrl();
-    this.ws = new WebSocket(url);
-
-    this.ws.on("open", async () => {
-      logger.info("Gemini Live WS connected", this.meta);
-
-      // Recording: start best-effort (must NOT affect voice)
-      this._call.recording_sid = await twilioStartRecording(this._call.callSid);
-      this._call.recording_url_public = twilioPublicRecordingUrl(this._call.recording_sid);
-
-      const systemText = buildSystemInstructionFromSSOT(this.ssot);
-
-      const setup = {
-        setup: {
-          model: normalizeModelName(env.GEMINI_LIVE_MODEL),
-          systemInstruction: systemText ? { parts: [{ text: systemText }] } : undefined,
-
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: env.VOICE_NAME_OVERRIDE || safeStr(this.ssot?.settings?.VOICE_NAME) || "Kore"
-                }
-              }
-            }
-          },
-
-          realtimeInputConfig: {
-            automaticActivityDetection: {
-              prefixPaddingMs: Number(env.MB_VAD_PREFIX_MS ?? 200),
-              silenceDurationMs: Number(env.MB_VAD_SILENCE_MS ?? 900)
-            }
-          },
-
-          ...(env.MB_LOG_TRANSCRIPTS ? { inputAudioTranscription: {}, outputAudioTranscription: {} } : {})
-        }
-      };
-
-      try {
-        this.ws.send(JSON.stringify(setup));
-        this.ready = true;
-      } catch (e) {
-        logger.error("Failed to send Gemini setup", { ...this.meta, error: e.message });
-      }
-    });
-
-    this.ws.on("message", (data) => {
-      let msg;
-      try {
-        msg = JSON.parse(data.toString("utf8"));
-      } catch {
-        return;
-      }
-
-      if (msg?.setupComplete && !this._greetingSent) {
-        this._greetingSent = true;
-        this._sendProactiveOpening();
-        return;
-      }
-
-      // AUDIO from Gemini -> Twilio
-      try {
-        const parts =
-          msg?.serverContent?.modelTurn?.parts ||
-          msg?.serverContent?.turn?.parts ||
-          msg?.serverContent?.parts ||
-          [];
-
-        for (const p of parts) {
-          const inline = p?.inlineData;
-          if (!inline || !inline?.data || !inline?.mimeType) continue;
-
-          if (String(inline.mimeType).startsWith("audio/pcm")) {
-            const ulawB64 = pcm24kB64ToUlaw8kB64(inline.data);
-            if (ulawB64 && this.onGeminiAudioUlaw8kBase64) {
-              this.onGeminiAudioUlaw8kBase64(ulawB64);
-            }
-          }
-        }
-      } catch (e) {
-        logger.debug("Gemini message parse error", { ...this.meta, error: e.message });
-      }
-
-      // Optional text parts
-      try {
-        const parts =
-          msg?.serverContent?.modelTurn?.parts ||
-          msg?.serverContent?.turn?.parts ||
-          msg?.serverContent?.parts ||
-          [];
-
-        for (const p of parts) {
-          const t = p?.text;
-          if (t && this.onGeminiText) this.onGeminiText(String(t));
-        }
-      } catch { /* ignore */ }
-
-      // Transcriptions (aggregated)
-      try {
-        const inTr = msg?.serverContent?.inputTranscription?.text;
-        if (inTr) this._onTranscriptChunk("user", String(inTr));
-
-        const outTr = msg?.serverContent?.outputTranscription?.text;
-        if (outTr) this._onTranscriptChunk("bot", String(outTr));
-      } catch { /* ignore */ }
-    });
-
-    this.ws.on("close", async (code, reasonBuf) => {
-      const reason = reasonBuf ? reasonBuf.toString("utf8") : "";
-      this.closed = true;
-      this.ready = false;
-
-      this._flushTranscript("user");
-      this._flushTranscript("bot");
-
-      logger.info("Gemini Live WS closed", { ...this.meta, code, reason });
-
-      // Stage4 finalize: always best-effort, never throws outward
-      await this._finalizeOnce("gemini_ws_close");
-    });
-
-    this.ws.on("error", (err) => {
-      logger.error("Gemini Live WS error", { ...this.meta, error: err.message });
-    });
-  }
-
-  _onTranscriptChunk(who, chunk) {
-    if (!env.MB_LOG_TRANSCRIPTS) return;
-
-    const c = chunk || "";
-    if (!c) return;
-
-    if (c === this._trLastChunk[who]) return;
-    this._trLastChunk[who] = c;
-
-    this._trBuf[who] = (this._trBuf[who] + c).slice(-800);
-
-    if (this._trTimer[who]) clearTimeout(this._trTimer[who]);
-    this._trTimer[who] = setTimeout(() => this._flushTranscript(who), 450);
-  }
-
-  _flushTranscript(who) {
-    if (!env.MB_LOG_TRANSCRIPTS) return;
-
-    if (this._trTimer[who]) {
-      clearTimeout(this._trTimer[who]);
-      this._trTimer[who] = null;
-    }
-
-    const text = (this._trBuf[who] || "").trim();
-    this._trBuf[who] = "";
-    if (!text) return;
-
-    const nlp = normalizeUtterance(text);
-
-    logger.info(`UTTERANCE ${who}`, {
-      ...this.meta,
-      text: nlp.raw,
-      normalized: nlp.normalized,
-      lang: nlp.lang
-    });
-
-    if (who === "user") {
-      const intent = detectIntent({
-        text: nlp.normalized || nlp.raw,
-        intents: this.ssot?.intents || []
-      });
-
-      logger.info("INTENT_DETECTED", {
-        ...this.meta,
-        text: nlp.raw,
-        normalized: nlp.normalized,
-        lang: nlp.lang,
-        intent
-      });
-    }
-
-    // ---- Stage4: capture lead fields deterministically (decision does NOT depend on transcript existence) ----
-    try {
-      this._call.transcript.push({
-        who,
-        text: nlp.raw,
-        normalized: nlp.normalized,
-        lang: nlp.lang,
-        ts: nowIso()
-      });
-
-      if (who === "user") {
-        const userText = (nlp.normalized || nlp.raw || "").trim();
-
-        // 1) Name capture
-        if (!this._call.lead.full_name) {
-          const name = extractNameHe(userText);
-          if (name) this._call.lead.full_name = name;
-        } else {
-          // 2) Subject capture (first meaningful request after name)
-          if (!this._call.lead.subject) {
-            const words = userText.split(/\s+/).filter(Boolean);
-            if (words.length >= (this._call.lead.subject_min_words || 3)) {
-              this._call.lead.subject = userText;
-            }
-          }
-
-          // 3) Callback number if withheld
-          if (this._call.caller_withheld && !this._call.lead.callback_to_number) {
-            const phone = extractPhone(userText);
-            if (phone) this._call.lead.callback_to_number = phone;
-          }
-        }
-      }
-    } catch (e) {
-      logger.debug("Stage4 lead capture failed", { error: String(e) });
-    }
-
-    if (this.onTranscript) {
-      this.onTranscript({ who, text: nlp.raw, normalized: nlp.normalized, lang: nlp.lang });
-    }
-  }
-
-  _sendProactiveOpening() {
-    if (!this.ws || this.closed || !this.ready) return;
-
-    const tz = env.TIME_ZONE || "Asia/Jerusalem";
-    const greeting = computeGreetingHebrew(tz);
-
-    const opening = getOpeningScriptFromSSOT(this.ssot, { GREETING: greeting });
-
-    const userKickoff =
-      `התחילי שיחה עכשיו. אמרי בדיוק את טקסט הפתיחה הבא בעברית (ללא תוספות וללא שינויים), ואז עצרי להקשבה:\n` +
-      opening;
-
-    const msg = {
-      clientContent: {
-        turns: [{ role: "user", parts: [{ text: userKickoff }] }],
-        turnComplete: true
-      }
-    };
-
-    try {
-      this.ws.send(JSON.stringify(msg));
-      logger.info("Proactive opening sent", { ...this.meta, greeting, opening_len: opening.length });
-    } catch (e) {
-      logger.debug("Failed sending proactive opening", { ...this.meta, error: e.message });
-    }
-  }
-
-  sendUlaw8kFromTwilio(ulaw8kB64) {
-    if (!this.ws || this.closed || !this.ready) return;
-
-    const pcm16kB64 = ulaw8kB64ToPcm16kB64(ulaw8kB64);
-
-    const msg = {
-      realtimeInput: {
-        mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: pcm16kB64 }]
-      }
-    };
-
-    try {
-      this.ws.send(JSON.stringify(msg));
-    } catch (e) {
-      logger.debug("Failed sending audio to Gemini", { ...this.meta, error: e.message });
-    }
-  }
-
-  endInput() {
-    if (!this.ws || this.closed) return;
-    try {
-      this.ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
-    } catch { /* ignore */ }
-  }
-
-  async _finalizeOnce(reason) {
-    if (this._call.finalized) return;
-    this._call.finalized = true;
-
-    try {
-      this._call.ended_at = nowIso();
-      const durationMs = Date.now() - new Date(this._call.started_at).getTime();
-
-      const transcriptText = this._call.transcript
-        .map((x) => `${String(x.who || "").toUpperCase()}: ${x.text}`)
-        .join("\n");
-
-      const callMeta = {
-        callSid: this._call.callSid,
-        streamSid: this._call.streamSid,
-        caller: this._call.caller_raw,
-        called: this._call.called,
-        source: this._call.source,
-        started_at: this._call.started_at,
-        ended_at: this._call.ended_at,
-        duration_ms: durationMs,
-        caller_withheld: this._call.caller_withheld,
-        finalize_reason: reason || ""
-      };
-
-      // optional passive context (non-breaking)
-      if (passiveCallContext?.buildPassiveContext) {
-        try {
-          callMeta.passive_context = passiveCallContext.buildPassiveContext({
-            meta: this.meta,
-            ssot: this.ssot
-          });
-        } catch { /* ignore */ }
-      }
-
-      const snapshot = {
-        call: callMeta,
-        lead: {
-          ...this._call.lead,
-          // Keep notes for now (you can later swap to crm_short summary in Stage4.2)
-          notes: transcriptText
-        }
-      };
-
-      await finalizePipeline({
-        snapshot,
-        env,
-        logger,
-        senders: {
-          sendCallLog: (payload) => deliverWebhook(env.CALL_LOG_WEBHOOK_URL, payload, "CALL_LOG"),
-          sendFinal: (payload) => deliverWebhook(env.FINAL_WEBHOOK_URL, payload, "FINAL"),
-          sendAbandoned: (payload) => deliverWebhook(env.ABANDONED_WEBHOOK_URL, payload, "ABANDONED"),
-          resolveRecording: async () => ({
-            recording_provider: this._call.recording_sid ? "twilio" : "",
-            recording_sid: this._call.recording_sid || "",
-            recording_url_public: this._call.recording_url_public || ""
-          })
-        }
-      });
-    } catch (e) {
-      logger.warn("Finalize failed", { error: String(e) });
-    }
-  }
-
-  stop() {
-    // Stage4: finalize (best-effort), then close Gemini WS.
-    this._finalizeOnce("stop_called").catch(() => {});
-
-    if (!this.ws) return;
-    try {
-      this.ws.close();
-    } catch { /* ignore */ }
-  }
-}
-
-module.exports = { GeminiLiveSession };
+async function twilioResolveRecordingByCallSid(callSid) {
+  if (!callSid) return "";
+  if (!truthy(env.MB_ENABLE_RECORDING)) re
