@@ -171,4 +171,4 @@ async function finalizeCall({
   }
 }
 
-module.exports = { finalizeCall };
+module.exports = { finalizePipeline: finalizeCall };
