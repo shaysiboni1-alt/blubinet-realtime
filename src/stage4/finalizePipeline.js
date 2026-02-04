@@ -1,101 +1,107 @@
-// src/stage4/finalizePipeline.js
+"use strict";
 
-export async function finalizePipeline({
-  snapshot,
-  env,
-  senders,
-  logger = console,
-}) {
+/**
+ * STAGE 4 – Post-call Finalization Pipeline (isolated)
+ *
+ * Guarantees:
+ * - Never throws (all exceptions are caught)
+ * - CALL_LOG sent at most once (respects CALL_LOG_MODE + flags)
+ * - FINAL and ABANDONED are mutually exclusive
+ * - FINAL decision does NOT depend on transcript (only on lead fields captured during the call)
+ * - Recording is best-effort and must not block webhook delivery
+ */
+
+function truthy(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes" || s === "y";
+}
+
+function safeSplitWords(s) {
+  return String(s || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function decideLead(lead) {
+  const fullName = String(lead?.full_name || "").trim();
+  const subject = String(lead?.subject || "").trim();
+  const cb = String(lead?.callback_to_number || "").trim();
+  const minWords = Number(lead?.subject_min_words || 3);
+
+  if (!fullName) return { type: "ABANDONED", reason: "missing_name" };
+  if (!subject || safeSplitWords(subject).length < minWords) {
+    return { type: "ABANDONED", reason: "subject_too_short" };
+  }
+  if (!cb) return { type: "ABANDONED", reason: "missing_callback" };
+
+  return { type: "FINAL", reason: "lead_complete" };
+}
+
+async function finalizePipeline({ snapshot, env, senders, logger }) {
+  const log = logger || console;
+
   const safe = async (fn, label) => {
     try {
       return await fn();
     } catch (err) {
-      logger.error(`[STAGE4:${label}]`, err);
+      log?.warn?.(`[STAGE4:${label}] failed`, { error: err?.message || String(err) });
       return null;
     }
   };
 
-  const sent = {
-    callLog: false,
-    final: false,
-    abandoned: false,
-  };
+  const callLogAtStart = truthy(env?.CALL_LOG_AT_START);
+  const callLogAtEnd = truthy(env?.CALL_LOG_AT_END);
+  const callLogMode = String(env?.CALL_LOG_MODE || "start").trim().toLowerCase(); // start|end|both
 
-  // 1) CALL_LOG – exactly once
-  if (env.CALL_LOG_AT_START || env.CALL_LOG_AT_END) {
+  // Decide which phase should send CALL_LOG.
+  const shouldSendCallLogNow = (() => {
+    // In our implementation we call finalizePipeline at end-of-call.
+    // So:
+    // - mode=start => still send once at end (because we intentionally centralize sending in Stage4)
+    // - mode=end   => send at end
+    // - mode=both  => send once at end (dedup by design)
+    if (!(callLogAtStart || callLogAtEnd)) return false;
+    if (callLogMode === "none") return false;
+    return true;
+  })();
+
+  if (shouldSendCallLogNow && senders?.sendCallLog) {
     await safe(() => senders.sendCallLog(snapshot), "CALL_LOG");
-    sent.callLog = true;
   }
 
-  // 2) החלטה דטרמיניסטית
-  const decision = decideLead(snapshot);
+  const decision = decideLead(snapshot?.lead || {});
 
-  // 3) Recording – חובה, best-effort
-  const recording = await safe(
-    () => senders.resolveRecording(snapshot),
-    "RECORDING"
-  );
+  // Recording – best effort
+  const recording = senders?.resolveRecording
+    ? await safe(() => senders.resolveRecording(snapshot), "RECORDING")
+    : null;
 
-  // 4) FINAL / ABANDONED – אחד בלבד
-  if (decision.type === "FINAL" && !sent.final) {
+  if (decision.type === "FINAL" && senders?.sendFinal) {
     const payload = {
-      ...snapshot.basePayload,
-      event_type: "FINAL",
-      lead_decision: "FINAL",
+      event: "FINAL",
+      call: snapshot?.call || {},
+      lead: snapshot?.lead || {},
       decision_reason: decision.reason,
-      recording_provider: recording?.provider || "twilio",
-      recording_sid: recording?.sid || null,
-      recording_url_public: recording?.publicUrl || null,
+      recording_provider: recording?.recording_provider || "",
+      recording_sid: recording?.recording_sid || "",
+      recording_url_public: recording?.recording_url_public || ""
     };
-
     await safe(() => senders.sendFinal(payload), "FINAL");
-    sent.final = true;
-  }
-
-  if (decision.type === "ABANDONED" && !sent.abandoned) {
+  } else if (decision.type === "ABANDONED" && senders?.sendAbandoned) {
     const payload = {
-      ...snapshot.basePayload,
-      event_type: "ABANDONED",
-      lead_decision: "ABANDONED",
+      event: "ABANDONED",
+      call: snapshot?.call || {},
+      lead: snapshot?.lead || {},
       decision_reason: decision.reason,
-      recording_provider: recording?.provider || "twilio",
-      recording_sid: recording?.sid || null,
-      recording_url_public: recording?.publicUrl || null,
+      recording_provider: recording?.recording_provider || "",
+      recording_sid: recording?.recording_sid || "",
+      recording_url_public: recording?.recording_url_public || ""
     };
-
     await safe(() => senders.sendAbandoned(payload), "ABANDONED");
-    sent.abandoned = true;
   }
 
-  return {
-    finalized: true,
-    decision: decision.type,
-    reason: decision.reason,
-  };
+  return { finalized: true, decision: decision.type, reason: decision.reason };
 }
 
-function decideLead(snapshot) {
-  const {
-    full_name,
-    subject,
-    callback_to_number,
-    subject_min_words,
-  } = snapshot.lead || {};
-
-  if (!full_name) {
-    return { type: "ABANDONED", reason: "missing_name" };
-  }
-
-  if (
-    !subject ||
-    subject.split(/\s+/).length < (subject_min_words || 3)
-  ) {
-    return { type: "ABANDONED", reason: "subject_too_short" };
-  }
-
-  if (!callback_to_number) {
-    return { type: "ABANDONED", reason: "missing_callback" };
-  }
-
-  return { type: "FINAL", reason: "lead_complete" };
-}
+module.exports = { finalizePipeline, decideLead };
