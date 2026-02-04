@@ -1,207 +1,241 @@
 "use strict";
 
 /**
- * Stage 4 – Canonical Call Finalization (Adapter + SSOT)
- * - Supports snapshot-based invocation (current runtime)
- * - CALL_LOG always
- * - FINAL xor ABANDONED (deterministic LeadGate)
+ * Stage 4 – Finalize Pipeline (GilSport-style)
+ * - Post-call LLM parsing (CRM-ready)
+ * - Deterministic FINAL / ABANDONED
+ * - Recording resolved AFTER call end
+ * - Does NOT touch media / voice / realtime
  */
+
+const fetch = global.fetch || require("node-fetch");
 
 function nowIso() {
   return new Date().toISOString();
 }
 
-function wordsCount(s) {
-  return String(s || "")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean).length;
-}
-
 function safeStr(v) {
-  return v === undefined || v === null ? "" : String(v);
+  return v === undefined || v === null ? "" : String(v).trim();
 }
 
+function wordsCount(s) {
+  return safeStr(s).split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * Deterministic LeadGate (same philosophy as GilSport)
+ */
 function computeLeadGate(lead) {
-  const name = safeStr(lead?.full_name);
-  const subject = safeStr(lead?.subject);
-  const phone = safeStr(lead?.callback_to_number);
+  if (!lead) return { ok: false, reason: "missing_lead" };
+
+  const name = safeStr(lead.full_name);
+  const reason = safeStr(lead.reason);
+  const notes = safeStr(lead.notes);
 
   if (!name || name.length < 2) {
     return { ok: false, reason: "missing_name" };
   }
 
-  const minWords = Number(lead?.subject_min_words || 3);
-  if (!subject || wordsCount(subject) < minWords) {
-    return { ok: false, reason: "missing_subject" };
-  }
-
-  if (!phone) {
-    return { ok: false, reason: "missing_phone" };
+  if (!reason && !notes) {
+    return { ok: false, reason: "missing_reason" };
   }
 
   return { ok: true, reason: "lead_complete" };
 }
 
 /**
- * finalizeCall – canonical (callState-based)
+ * Run LLM Lead Parser (GilSport-style, post-call)
  */
-async function finalizeCall({ reason, callState, env, logger, senders }) {
-  if (!callState || typeof callState !== "object") {
-    throw new TypeError("finalizeCall: callState is missing/invalid");
+async function runLeadParser({ env, prompt, transcriptText }) {
+  if (!env.LEAD_PARSER_ENABLED) return null;
+  if (!prompt) return null;
+
+  const apiKey = env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  const model = env.LEAD_PARSER_MODEL || "gemini-1.5-flash";
+
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text:
+              prompt +
+              "\n\nTRANSCRIPT:\n" +
+              transcriptText
+          }
+        ]
+      }
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 600
+    }
+  };
+
+  try {
+    const resp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      }
+    );
+
+    const json = await resp.json();
+    const text =
+      json?.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text)
+        .join("") || "";
+
+    const trimmed = text.trim();
+
+    // Direct JSON
+    if (trimmed.startsWith("{")) {
+      return JSON.parse(trimmed);
+    }
+
+    // Fenced JSON
+    const m = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (m && m[1]) {
+      return JSON.parse(m[1].trim());
+    }
+  } catch {
+    return null;
   }
 
-  // 0) Guard – run exactly once
-  if (callState.finalized) {
-    logger?.debug?.("finalizeCall: already finalized");
-    return;
-  }
-  callState.finalized = true;
+  return null;
+}
 
-  // 1) Close timing
-  const endedAt = nowIso();
-  callState.ended_at = endedAt;
+/**
+ * FINALIZE PIPELINE – SINGLE ENTRY POINT
+ */
+async function finalizePipeline({
+  snapshot,
+  env,
+  logger,
+  senders,
+  state
+}) {
+  if (state?.finalized) return;
+  if (state) state.finalized = true;
 
-  const startedAtMs = new Date(callState.started_at || Date.now()).getTime();
-  const durationMs = Date.now() - startedAtMs;
+  const call = snapshot.call || {};
+  const transcriptArr = snapshot.transcript || [];
 
-  // 2) Resolve recording (best-effort, blocking)
+  const transcriptText = transcriptArr
+    .map((t) => `${String(t.who || "").toUpperCase()}: ${t.text}`)
+    .join("\n");
+
+  // ------------------------------------------------------------
+  // 1. Resolve Recording (AFTER call end, best-effort)
+  // ------------------------------------------------------------
   let recording = {
     recording_provider: "",
     recording_sid: "",
     recording_url_public: ""
   };
 
-  // IMPORTANT: keep it best-effort; do not block webhooks if resolveRecording fails.
-  try {
-    const enableRecording =
-      !!env?.MB_ENABLE_RECORDING || String(env?.MB_ENABLE_RECORDING || "").toLowerCase() === "true";
-
-    if (enableRecording && senders?.resolveRecording) {
+  if (env.MB_ENABLE_RECORDING && senders?.resolveRecording) {
+    try {
       const r = await senders.resolveRecording();
-      if (r && typeof r === "object") {
+      if (r) {
         recording = {
           recording_provider: safeStr(r.recording_provider),
           recording_sid: safeStr(r.recording_sid),
           recording_url_public: safeStr(r.recording_url_public)
         };
       }
-    }
-  } catch (e) {
-    logger?.warn?.("Recording resolve failed", { error: String(e) });
+    } catch {}
   }
 
-  // 3) LeadGate – deterministic decision
-  const gate = computeLeadGate(callState.lead);
+  // ------------------------------------------------------------
+  // 2. LLM Parsing (GilSport style)
+  // ------------------------------------------------------------
+  let parsed = null;
+  try {
+    parsed = await runLeadParser({
+      env,
+      prompt: snapshot.ssot?.prompts?.LEAD_PARSER_PROMPT,
+      transcriptText
+    });
+  } catch {}
 
-  // 4) Build base payload (stable contract)
+  const lead = {
+    full_name: parsed?.full_name ?? null,
+    phone_number: parsed?.phone_number ?? null,
+    prefers_caller_id: parsed?.prefers_caller_id ?? null,
+    intent: parsed?.intent ?? "unknown",
+    reason: parsed?.reason ?? "",
+    notes: parsed?.notes ?? ""
+  };
+
+  // ------------------------------------------------------------
+  // 3. LeadGate
+  // ------------------------------------------------------------
+  const gate = computeLeadGate(lead);
+
+  // ------------------------------------------------------------
+  // 4. Base Payload
+  // ------------------------------------------------------------
   const basePayload = {
-    event: null,
-
     call: {
-      callSid: safeStr(callState.callSid),
-      streamSid: safeStr(callState.streamSid),
-      caller: safeStr(callState.caller),
-      called: safeStr(callState.called),
-      source: safeStr(callState.source),
-
-      caller_withheld: !!callState.caller_withheld,
-
-      started_at: safeStr(callState.started_at),
-      ended_at: endedAt,
-      duration_ms: durationMs,
-
-      finalize_reason: safeStr(reason)
+      callSid: call.callSid,
+      streamSid: call.streamSid,
+      caller: call.caller,
+      called: call.called,
+      source: call.source,
+      started_at: call.started_at,
+      ended_at: call.ended_at,
+      duration_ms: call.duration_ms,
+      finalize_reason: call.finalize_reason || ""
     },
-
     lead: {
-      ...(callState.lead || {}),
+      ...lead,
       decision_reason: gate.reason
     },
-
     recording_provider: recording.recording_provider,
     recording_sid: recording.recording_sid,
     recording_url_public: recording.recording_url_public
   };
 
-  // 5) CALL_LOG – always
+  // ------------------------------------------------------------
+  // 5. CALL_LOG (always)
+  // ------------------------------------------------------------
   try {
     if (senders?.sendCallLog) {
-      await senders.sendCallLog({ ...basePayload, event: "CALL_LOG" });
+      await senders.sendCallLog({
+        event: "CALL_LOG",
+        ...basePayload
+      });
     }
-  } catch (e) {
-    logger?.warn?.("CALL_LOG webhook failed", { error: String(e) });
-  }
+  } catch {}
 
-  // 6) FINAL xor ABANDONED
+  // ------------------------------------------------------------
+  // 6. FINAL xor ABANDONED
+  // ------------------------------------------------------------
   if (gate.ok) {
     try {
       if (senders?.sendFinal) {
-        await senders.sendFinal({ ...basePayload, event: "FINAL" });
+        await senders.sendFinal({
+          event: "FINAL",
+          ...basePayload
+        });
       }
-    } catch (e) {
-      logger?.warn?.("FINAL webhook failed", { error: String(e) });
-    }
+    } catch {}
   } else {
     try {
       if (senders?.sendAbandoned) {
-        await senders.sendAbandoned({ ...basePayload, event: "ABANDONED" });
+        await senders.sendAbandoned({
+          event: "ABANDONED",
+          ...basePayload
+        });
       }
-    } catch (e) {
-      logger?.warn?.("ABANDONED webhook failed", { error: String(e) });
-    }
+    } catch {}
   }
 }
 
-/**
- * finalizePipeline – ADAPTER (snapshot-based)
- * This matches the current runtime call site in geminiLiveSession.js
- */
-async function finalizePipeline({ reason, snapshot, env, logger, senders } = {}) {
-  if (!snapshot || typeof snapshot !== "object") {
-    throw new TypeError("finalizePipeline: snapshot is missing/invalid");
-  }
-
-  // allow caller to store guard on snapshot
-  if (snapshot.__finalized_stage4) {
-    logger?.debug?.("finalizePipeline: snapshot already finalized");
-    return;
-  }
-  snapshot.__finalized_stage4 = true;
-
-  const call = snapshot.call || {};
-  const lead = snapshot.lead || {};
-
-  const callState = {
-    finalized: false,
-
-    callSid: call.callSid,
-    streamSid: call.streamSid,
-    caller: call.caller,
-    called: call.called,
-    source: call.source,
-
-    caller_withheld: !!call.caller_withheld,
-
-    started_at: call.started_at || nowIso(),
-    ended_at: call.ended_at || null,
-
-    lead
-  };
-
-  const effectiveReason = safeStr(reason || call.finalize_reason || call.reason || "unknown");
-
-  return finalizeCall({
-    reason: effectiveReason,
-    callState,
-    env,
-    logger,
-    senders
-  });
-}
-
-module.exports = {
-  finalizePipeline,
-  finalizeCall,
-  computeLeadGate
-};
+module.exports = { finalizePipeline };
