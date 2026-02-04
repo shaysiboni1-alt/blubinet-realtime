@@ -1,5 +1,7 @@
 "use strict";
 
+const { finalizePipeline } = require("../stage4/finalizePipeline");
+
 const WebSocket = require("ws");
 const { env } = require("../config/env");
 const { logger } = require("../utils/logger");
@@ -481,6 +483,7 @@ class GeminiLiveSession {
       duration_ms: 0,
       name: "",
       has_request: false,
+      subject_text: "",
       callback_number: callerInfo.withheld ? "" : callerInfo.value,
       transcript: [],
       recordingSid: "",
@@ -714,6 +717,9 @@ class GeminiLiveSession {
           const body = (nlp.normalized || nlp.raw || "").trim();
           if (body.length >= 6) this._call.has_request = true;
 
+          // Keep last request/subject text for deterministic FINAL (no transcript dependency at finalize)
+          if (body) this._call.subject_text = body.slice(0, 260);
+
           // Capture callback number if caller withheld
           if (this._call.caller_withheld && !this._call.callback_number) {
             const phone = extractPhone(nlp.normalized || nlp.raw);
@@ -799,13 +805,7 @@ class GeminiLiveSession {
       this._call.ended_at = nowIso();
       this._call.duration_ms = Date.now() - new Date(this._call.started_at).getTime();
 
-      const transcriptText = this._call.transcript
-        .map((x) => `${String(x.who || "").toUpperCase()}: ${x.text}`)
-        .join("\n");
-
-      const leadComplete = Boolean(this._call.name && this._call.has_request);
-      const eventType = leadComplete ? "FINAL" : "ABANDONED";
-
+      // Build minimal, stable call meta (no dependency on transcript availability)
       const callMeta = {
         callSid: this._call.callSid,
         streamSid: this._call.streamSid,
@@ -816,13 +816,10 @@ class GeminiLiveSession {
         ended_at: this._call.ended_at,
         duration_ms: this._call.duration_ms,
         caller_withheld: this._call.caller_withheld,
-        recording_provider: this._call.recordingSid ? "twilio" : "",
-        recording_sid: this._call.recordingSid || "",
-        recording_url_public: this._call.recording_url_public || "",
         finalize_reason: reason || ""
       };
 
-      // optional: use passiveCallContext if present (non-breaking)
+      // Optional passive context (best-effort)
       if (passiveCallContext?.buildPassiveContext) {
         try {
           callMeta.passive_context = passiveCallContext.buildPassiveContext({
@@ -832,29 +829,39 @@ class GeminiLiveSession {
         } catch { /* ignore */ }
       }
 
-      // CALL_LOG at end (optional) so you get duration even if you keep start log
-      if (isTruthyEnv(env.CALL_LOG_AT_END ?? false)) {
-        await deliverWebhookDirect("CALL_LOG", { event: "CALL_LOG", phase: "end", call: callMeta });
-      }
+      const subjectMinWords = Number(this.ssot?.settings?.SUBJECT_MIN_WORDS || 3);
 
-      let leadParser = null;
-      if (leadComplete && safeStr(env.LEAD_PARSER_MODE || "postcall") === "postcall") {
-        leadParser = await runLeadParserLLM({ ssot: this.ssot, transcriptText, callMeta });
-        if (!leadParser) {
-          leadParser = buildDeterministicLeadSummary({ transcriptItems: this.state.transcript, callMeta, state: this.state });
+      const lead = {
+        full_name: this._call.name || "",
+        subject: this._call.subject_text || "",
+        subject_min_words: subjectMinWords,
+        callback_to_number: this._call.callback_number || ""
+      };
+
+      const snapshot = { call: callMeta, lead };
+
+      await finalizePipeline({
+        snapshot,
+        env,
+        logger,
+        senders: {
+          sendCallLog: (snap) => deliverWebhookDirect("CALL_LOG", { event: "CALL_LOG", phase: "end", call: snap.call, lead: snap.lead }),
+          sendFinal: (payload) => deliverWebhookDirect("FINAL", payload),
+          sendAbandoned: (payload) => deliverWebhookDirect("ABANDONED", payload),
+          resolveRecording: async () => {
+            // recordingSid may exist if we started recording; public URL is derived from PUBLIC_BASE_URL
+            const sid = String(this._call.recordingSid || "").trim();
+            return {
+              recording_provider: sid ? "twilio" : "",
+              recording_sid: sid || "",
+              recording_url_public: sid ? publicRecordingUrl(sid) : ""
+            };
+          }
         }
-      }
-
-      const summaryObj =
-  leadParser || buildDeterministicLeadSummary({ transcriptItems: this.state.transcript, callMeta, state: this.state });
-
-const leadNotes = buildLeadNotes(summaryObj);
-
-const payload = {
-  event: eventType,
-  call: {
-    ...callMeta,
-    ...(isTruthyEnv(env.MB_INCLUDE_TRANSCRIPT_IN_WEBHOOK ?? false) ? { transcript: transcriptText } : {})
+      });
+    } catch (e) {
+      logger.warn("Stage4 finalize failed (guarded)", { error: String(e?.message || e) });
+    }
   },
   lead: {
     name: this.state.name || "",
