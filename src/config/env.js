@@ -50,7 +50,11 @@ const env = {
 
   // Webhooks
   CALL_LOG_WEBHOOK_URL: opt("CALL_LOG_WEBHOOK_URL", ""),
+  CALL_LOG_AT_START: opt("CALL_LOG_AT_START", "false") === "true",
+  CALL_LOG_AT_END: opt("CALL_LOG_AT_END", "true") === "true",
+  CALL_LOG_MODE: opt("CALL_LOG_MODE", "start"),
   FINAL_WEBHOOK_URL: opt("FINAL_WEBHOOK_URL", ""),
+  FINAL_ON_STOP: opt("FINAL_ON_STOP", "true") === "true",
   ABANDONED_WEBHOOK_URL: opt("ABANDONED_WEBHOOK_URL", ""),
 
   // VAD / Silence (future)
