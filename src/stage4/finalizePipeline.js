@@ -127,7 +127,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     if (env.CALL_LOG_AT_START === "true" && env.CALL_LOG_MODE === "start") {
       // Already sent at start by other stage; do nothing.
     }
-    if isTrue(env.CALL_LOG_AT_END) {
+    if (isTrue(env.CALL_LOG_AT_END)) {
       const payload = {
         event: "CALL_LOG",
         call: {
