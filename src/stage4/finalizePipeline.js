@@ -124,7 +124,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
 
   // 1) CALL_LOG (always, if enabled)
   try {
-    if (isTrue(env.CALL_LOG_AT_START) && String(env.CALL_LOG_MODE || "").toLowerCase() === "start") {
+    if (env.CALL_LOG_AT_START === "true" && env.CALL_LOG_MODE === "start") {
       // Already sent at start by other stage; do nothing.
     }
     if (isTrue(env.CALL_LOG_AT_END)) {
@@ -155,12 +155,16 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   let parsed = null;
   try {
     const transcriptText = snapshot?.lead?.transcriptText || snapshot?.transcriptText || "";
-    const shouldParse = isTrue(env.LEAD_PARSER_ENABLED);
+    const shouldParse = env.LEAD_PARSER_ENABLED === "true";
 
     if (shouldParse) {
       parsed = await parseLeadPostcall({
         transcriptText,
         ssot,
+          known: {
+            full_name: safeStr(snapshot?.lead?.full_name) || null,
+            caller_id_e164: safeStr(call?.caller_id_e164 || call?.caller || null),
+          },
         env,
         logger: log,
       });
@@ -172,11 +176,13 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   const parsedDerived = deriveSubjectAndReason(parsed || {});
 
   const lead = {
-    full_name: safeStr(parsed?.full_name) || safeStr(snapshot?.lead?.full_name) || null,
+    // GilSport parity: prefer deterministic LeadGate values from runtime; LLM is fallback only.
+    full_name: safeStr(snapshot?.lead?.full_name) || safeStr(parsed?.full_name) || null,
     subject: parsedDerived.subject || safeStr(snapshot?.lead?.subject) || null,
     reason: parsedDerived.reason || safeStr(snapshot?.lead?.reason) || null,
     phone_additional: safeStr(parsed?.phone_additional) || null,
-    parsing_summary: safeStr(parsed?.parsing_summary) || safeStr(snapshot?.lead?.notes) || null,
+    // GilSport parity: parsing_summary must be an LLM CRM-style summary, not raw transcript.
+    parsing_summary: safeStr(parsed?.parsing_summary) || null,
   };
 
   // 3) Resolve recording (best-effort)
@@ -186,7 +192,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
     recording_url_public: null,
   };
   try {
-    if (isTrue(env.MB_ENABLE_RECORDING) && typeof senders.resolveRecording === "function") {
+    if (env.MB_ENABLE_RECORDING === "true" && typeof senders.resolveRecording === "function") {
       recording = await senders.resolveRecording(call.callSid);
     }
   } catch (e) {
@@ -194,7 +200,7 @@ async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
   }
 
   // 4) Deterministic LeadGate -> FINAL xor ABANDONED
-  const isFinal = !!shouldFinalizeAsLead(lead) && isTrue(env.FINAL_ON_STOP);
+  const isFinal = !!shouldFinalizeAsLead(lead) && env.FINAL_ON_STOP === "true";
   lead.decision_reason = decisionReason(lead);
 
   const finalPayload = buildFinalPayload({
