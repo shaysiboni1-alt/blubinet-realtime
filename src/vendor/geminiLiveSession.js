@@ -180,6 +180,16 @@ function normalizeCallerId(caller) {
   return { value: s, withheld: digits.length < 5 };
 }
 
+function normalizeHebrewName(name) {
+  const n = (name || "").trim();
+  if (!n) return "";
+  // Collapse repeated Hebrew letters (e.g. "שיי" -> "שי")
+  if (/^[\u0590-\u05FF\s-]+$/.test(n)) {
+    return n.replace(/([\u0590-\u05FF])\1+/g, "$1");
+  }
+  return n;
+}
+
 function extractNameHe(text) {
   const t = (text || "").trim();
   if (!t) return "";
@@ -189,7 +199,7 @@ function extractNameHe(text) {
   if (m && m[1]) {
     const candidate = m[1].trim();
     // keep at most 3 tokens ("שי סיבוני" etc.)
-    return candidate.split(/\s+/).slice(0, 3).join(" ");
+    return normalizeHebrewName(candidate.split(/\s+/).slice(0, 3).join(" "));
   }
 
   // As a fallback, accept a very short Hebrew token as a name (but only if it's clean).
@@ -199,7 +209,7 @@ function extractNameHe(text) {
   const words = compact.split(/\s+/).filter(Boolean);
   if (words.length > 2) return "";
   if (compact.length > 25) return "";
-  return compact;
+  return normalizeHebrewName(compact);
 }
 
 function stripNamePhrases(text) {
@@ -209,6 +219,11 @@ function stripNamePhrases(text) {
   // "... קוראים לי שי" / "שמי שי" / "השם שלי שי" / "אני שי".
   t = t.replace(/(?:,|\s)*(?:קוראים לי|שמי|השם שלי(?:\s+זה)?|אני)\s+[^\n,.!?]{1,40}/g, " ");
   return t.replace(/\s+/g, " ").trim();
+}
+
+// Backward-compatible alias (older call-site used a singular name)
+function stripNamePhrase(text) {
+  return stripNamePhrases(text);
 }
 
 function extractNameDeterministic(text, { allowFallbackShortToken = false } = {}) {
