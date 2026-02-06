@@ -1,206 +1,312 @@
 "use strict";
 
-/*
-  Stage 4 – Finalize Pipeline (GilSport parity)
+/**
+ * Post-call lead parser (GilSport-style enrichment)
+ *
+ * Contract:
+ *   parseLeadPostcall({ transcriptText, ssot, known, env, logger }) -> {
+ *     full_name?: string,
+ *     subject?: string,
+ *     reason?: string,
+ *     phone_additional?: string,
+ *     parsing_summary?: string
+ *   }
+ *
+ * MUST:
+ * - never throw
+ * - return {} on failure
+ *
+ * Supports:
+ * - Vertex AI (recommended when GEMINI_VERTEX_ENABLED=true)
+ * - Gemini API key fallback
+ */
 
-  FINAL Lead =:
-  - full_name
-  - subject (>= SUBJECT_MIN_WORDS)
-  - caller_id_e164 ALWAYS
-  - callback_to_number (caller or additional or both)
-
-  Webhooks:
-  - CALL_LOG
-  - FINAL
-  - ABANDONED
-*/
-
-const { parseLeadPostcall } = require("./postcallLeadParser");
-
-function isTrue(v) {
-  return v === true || String(v).toLowerCase() === "true";
-}
+const crypto = require("crypto");
 
 function safeStr(v) {
   const s = typeof v === "string" ? v.trim() : "";
   return s || null;
 }
 
-function secondsFromMs(ms) {
-  const n = Number(ms);
-  if (!Number.isFinite(n) || n < 0) return null;
-  return Math.round(n / 1000);
+function isTrue(v) {
+  return v === true || String(v).toLowerCase() === "true";
 }
 
-function subjectValid(subject, minWords) {
-  if (!subject) return false;
-  return subject.trim().split(/\s+/).length >= minWords;
+function b64decodeJson(b64) {
+  try {
+    const raw = Buffer.from(String(b64).replace(/^"+|"+$/g, ""), "base64").toString("utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
-function buildPayloadBase(call, recording) {
+function extractJsonObject(text) {
+  if (!text) return null;
+  // try to find first {...} JSON object
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  const slice = text.slice(start, end + 1);
+  try {
+    return JSON.parse(slice);
+  } catch {
+    // try to repair: remove trailing commas
+    try {
+      const repaired = slice.replace(/,\s*}/g, "}").replace(/,\s*]/g, "]");
+      return JSON.parse(repaired);
+    } catch {
+      return null;
+    }
+  }
+}
+
+function pickTextFromModelResponse(modelResponse) {
+  // Supports both Vertex generateContent and Gemini API generateContent formats (best-effort)
+  try {
+    // Vertex / Gemini often: candidates[0].content.parts[].text
+    const cand = modelResponse?.candidates?.[0];
+    const parts = cand?.content?.parts;
+    if (Array.isArray(parts)) {
+      const txt = parts.map((p) => p?.text).filter(Boolean).join("\n");
+      if (txt) return txt;
+    }
+    // Some formats: output_text
+    if (typeof modelResponse?.output_text === "string") return modelResponse.output_text;
+  } catch {}
+  return "";
+}
+
+function normalizeResult(obj) {
+  const full_name = safeStr(obj?.full_name);
+  const subject = safeStr(obj?.subject);
+  const reason = safeStr(obj?.reason);
+  const phone_additional = safeStr(obj?.phone_additional);
+  const parsing_summary = safeStr(obj?.parsing_summary);
+
+  // return only known keys
+  const out = {};
+  if (full_name) out.full_name = full_name;
+  if (subject) out.subject = subject;
+  if (reason) out.reason = reason;
+  if (phone_additional) out.phone_additional = phone_additional;
+  if (parsing_summary) out.parsing_summary = parsing_summary;
+  return out;
+}
+
+/** ---------------- Vertex Auth (Service Account) ---------------- */
+
+function base64url(buf) {
+  return Buffer.from(buf)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function signJwtRS256({ client_email, private_key, token_uri }) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
   const payload = {
-    callSid: safeStr(call.callSid),
-    caller_id_e164: safeStr(call.caller),
-    recording_provider: recording?.recording_provider || null,
-    recording_sid: recording?.recording_sid || null,
-    recording_url_public: recording?.recording_url_public || null
+    iss: client_email,
+    scope: "https://www.googleapis.com/auth/cloud-platform",
+    aud: token_uri || "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
   };
-  return payload;
+
+  const encHeader = base64url(JSON.stringify(header));
+  const encPayload = base64url(JSON.stringify(payload));
+  const toSign = `${encHeader}.${encPayload}`;
+
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(toSign);
+  signer.end();
+  const sig = signer.sign(private_key);
+  const encSig = base64url(sig);
+
+  return `${toSign}.${encSig}`;
 }
 
-function leadGate(lead, call, subjectMinWords) {
-  if (!safeStr(lead.full_name)) return "missing_name";
-  if (!subjectValid(lead.subject, subjectMinWords)) return "missing_subject";
-  if (!safeStr(call.caller)) return "missing_caller_id";
-  if (!safeStr(lead.callback_to_number)) return "missing_callback_number";
-  return "ok";
+async function getVertexAccessTokenFromServiceAccountB64(saB64) {
+  const sa = b64decodeJson(saB64);
+  if (!sa?.client_email || !sa?.private_key) return null;
+
+  const tokenUri = sa.token_uri || "https://oauth2.googleapis.com/token";
+  const assertion = signJwtRS256({
+    client_email: sa.client_email,
+    private_key: sa.private_key,
+    token_uri: tokenUri,
+  });
+
+  const body = new URLSearchParams({
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    assertion,
+  });
+
+  const res = await fetch(tokenUri, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (!res.ok) return null;
+  const json = await res.json().catch(() => null);
+  return json?.access_token || null;
 }
 
-async function finalizePipeline({ snapshot, ssot, env, logger, senders }) {
+/** ---------------- Model Calls ---------------- */
+
+async function callVertexGenerateContent({ projectId, location, model, accessToken, contents }) {
+  const url =
+    `https://${location}-aiplatform.googleapis.com/v1/` +
+    `projects/${encodeURIComponent(projectId)}/locations/${encodeURIComponent(location)}` +
+    `/publishers/google/models/${encodeURIComponent(model)}:generateContent`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ contents }),
+  });
+
+  const text = await res.text();
+  if (!res.ok) return { ok: false, raw: text };
+  try {
+    return { ok: true, json: JSON.parse(text) };
+  } catch {
+    return { ok: true, json: { raw_text: text } };
+  }
+}
+
+async function callGeminiApiGenerateContent({ apiKey, model, contents }) {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=` +
+    encodeURIComponent(apiKey);
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contents }),
+  });
+
+  const text = await res.text();
+  if (!res.ok) return { ok: false, raw: text };
+  try {
+    return { ok: true, json: JSON.parse(text) };
+  } catch {
+    return { ok: true, json: { raw_text: text } };
+  }
+}
+
+/** ---------------- Main Parser ---------------- */
+
+async function parseLeadPostcall({ transcriptText, ssot, known, env, logger }) {
   const log = logger || console;
 
-  const call = {
-    callSid: snapshot?.call?.callSid || null,
-    streamSid: snapshot?.call?.streamSid || null,
-    caller: snapshot?.call?.caller || null,
-    called: snapshot?.call?.called || null,
-    started_at: snapshot?.call?.started_at || null,
-    ended_at: snapshot?.call?.ended_at || null,
-    duration_ms: snapshot?.call?.duration_ms ?? null,
-    duration_sec: secondsFromMs(snapshot?.call?.duration_ms),
-    finalize_reason: snapshot?.call?.finalize_reason || null
-  };
-
-  /* --------------------------------------------------
-     1) CALL_LOG (idempotent, per ENV)
-  -------------------------------------------------- */
   try {
-    if (isTrue(env.CALL_LOG_AT_END) && env.CALL_LOG_WEBHOOK_URL) {
-      await senders.sendCallLog({
-        event_type: "CALL_LOG",
-        call: {
-          callSid: call.callSid,
-          streamSid: call.streamSid,
-          caller: call.caller,
-          called: call.called,
-          started_at: call.started_at,
-          ended_at: call.ended_at,
-          duration_ms: call.duration_ms,
-          duration_sec: call.duration_sec,
-          finalize_reason: call.finalize_reason
+    const transcript = safeStr(transcriptText) || "";
+    if (!transcript) return {};
+
+    const prompts = ssot?.prompts || ssot?.PROMPTS || {};
+    const settings = ssot?.settings || ssot?.SETTINGS || {};
+
+    const leadParserPrompt =
+      safeStr(prompts?.LEAD_PARSER_PROMPT) ||
+      // fallback (very strict output contract)
+      "You are a post-call lead parser for a phone call. Return ONLY valid JSON with keys: full_name, subject, reason, phone_additional, parsing_summary. Do not include any other text.";
+
+    const style = safeStr(env?.LEAD_SUMMARY_STYLE || process.env.LEAD_SUMMARY_STYLE) || "crm_short";
+    const businessName = safeStr(settings?.BUSINESS_NAME) || safeStr(env?.BUSINESS_NAME) || "";
+
+    const knownName = safeStr(known?.full_name) || "";
+    const knownCaller = safeStr(known?.caller_id_e164) || "";
+
+    // GilSport-style: hard JSON contract
+    const instruction = [
+      leadParserPrompt,
+      "",
+      "OUTPUT CONTRACT:",
+      "- Return ONLY JSON (no markdown).",
+      "- Keys: full_name, subject, reason, phone_additional, parsing_summary",
+      "- parsing_summary must be short CRM style (" + style + "), 1-2 sentences, no transcript dump.",
+      "- subject must be a short headline (>= 3 words if possible).",
+      "- phone_additional: ONLY if caller asked for a different callback number; otherwise null/omit.",
+      "- Never invent phone numbers. If uncertain, omit phone_additional.",
+      "",
+      businessName ? `BUSINESS: ${businessName}` : "",
+      knownCaller ? `KNOWN caller_id_e164: ${knownCaller}` : "",
+      knownName ? `KNOWN full_name: ${knownName}` : "",
+      "",
+      "TRANSCRIPT:",
+      transcript,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const contents = [
+      {
+        role: "user",
+        parts: [{ text: instruction }],
+      },
+    ];
+
+    const useVertex =
+      isTrue(env?.GEMINI_VERTEX_ENABLED || process.env.GEMINI_VERTEX_ENABLED) ||
+      isTrue(process.env.GEMINI_VERTEX_ENABLED);
+
+    let modelResp = null;
+
+    if (useVertex) {
+      const projectId = safeStr(env?.GEMINI_PROJECT_ID || process.env.GEMINI_PROJECT_ID);
+      const location = safeStr(env?.GEMINI_LOCATION || process.env.GEMINI_LOCATION) || "us-central1";
+      const model = safeStr(env?.LEAD_PARSER_MODEL || process.env.LEAD_PARSER_MODEL) || "gemini-1.5-flash";
+      const saB64 = env?.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64;
+
+      if (projectId && saB64) {
+        const token = await getVertexAccessTokenFromServiceAccountB64(saB64);
+        if (token) {
+          const r = await callVertexGenerateContent({
+            projectId,
+            location,
+            model,
+            accessToken: token,
+            contents,
+          });
+          if (r.ok) modelResp = r.json;
+          else log.warn?.("Vertex lead parser failed", { raw: r.raw?.slice?.(0, 300) });
+        } else {
+          log.warn?.("Vertex access token missing (service account issue)");
         }
-      });
-    }
-  } catch (e) {
-    log.warn("CALL_LOG failed", e?.message || e);
-  }
-
-  /* --------------------------------------------------
-     2) Post-call parsing (LLM = enrichment בלבד)
-  -------------------------------------------------- */
-  let parsed = {};
-  try {
-    if (isTrue(env.LEAD_PARSER_ENABLED)) {
-      parsed = await parseLeadPostcall({
-        transcriptText:
-          snapshot?.lead?.transcriptText ||
-          snapshot?.transcriptText ||
-          "",
-        ssot,
-        known: {
-          full_name: safeStr(snapshot?.lead?.full_name),
-          caller_id_e164: safeStr(call.caller)
-        },
-        env,
-        logger: log
-      }) || {};
-    }
-  } catch (e) {
-    log.warn("Postcall parsing failed", e?.message || e);
-  }
-
-  /* --------------------------------------------------
-     3) Build lead (GilSport priority)
-        Runtime > Parser
-  -------------------------------------------------- */
-  const lead = {
-    full_name:
-      safeStr(snapshot?.lead?.full_name) ||
-      safeStr(parsed.full_name),
-
-    subject:
-      safeStr(snapshot?.lead?.subject) ||
-      safeStr(parsed.subject),
-
-    callback_to_number:
-      safeStr(snapshot?.lead?.callback_to_number) ||
-      safeStr(parsed.phone_additional) ||
-      safeStr(call.caller),
-
-    phone_additional: safeStr(parsed.phone_additional) || null,
-    parsing_summary: safeStr(parsed.parsing_summary) || null
-  };
-
-  /* --------------------------------------------------
-     4) Resolve recording (best effort)
-  -------------------------------------------------- */
-  let recording = {
-    recording_provider: null,
-    recording_sid: null,
-    recording_url_public: null
-  };
-
-  try {
-    if (isTrue(env.MB_ENABLE_RECORDING)) {
-      recording = await senders.resolveRecording(call.callSid);
-    }
-  } catch (e) {
-    log.warn("Recording resolve failed", e?.message || e);
-  }
-
-  /* --------------------------------------------------
-     5) FINAL xor ABANDONED
-  -------------------------------------------------- */
-  const subjectMinWords = Number(env.SUBJECT_MIN_WORDS || 3);
-  const gateResult = leadGate(lead, call, subjectMinWords);
-
-  const basePayload = buildPayloadBase(call, recording);
-
-  if (gateResult === "ok" && isTrue(env.FINAL_ON_STOP)) {
-    const finalPayload = {
-      event_type: "FINAL",
-      lead_decision: "FINAL",
-      ...basePayload,
-      full_name: lead.full_name,
-      subject: lead.subject,
-      callback_to_number: lead.callback_to_number,
-      phone_additional: lead.phone_additional,
-      parsing_summary: lead.parsing_summary
-    };
-
-    try {
-      await senders.sendFinal(finalPayload);
-    } catch (e) {
-      log.error("FINAL webhook failed", e?.message || e);
+      } else {
+        log.warn?.("Vertex lead parser skipped (missing GEMINI_PROJECT_ID or GOOGLE_SERVICE_ACCOUNT_JSON_B64)");
+      }
     }
 
-    return { status: "ok", event: "FINAL" };
+    // Fallback: Gemini API key
+    if (!modelResp) {
+      const apiKey = safeStr(env?.GEMINI_API_KEY || process.env.GEMINI_API_KEY);
+      const model = safeStr(env?.LEAD_PARSER_MODEL || process.env.LEAD_PARSER_MODEL) || "gemini-1.5-flash";
+      if (apiKey) {
+        const r = await callGeminiApiGenerateContent({ apiKey, model, contents });
+        if (r.ok) modelResp = r.json;
+        else log.warn?.("Gemini API lead parser failed", { raw: r.raw?.slice?.(0, 300) });
+      }
+    }
+
+    if (!modelResp) return {};
+
+    const textOut = pickTextFromModelResponse(modelResp);
+    const obj = extractJsonObject(textOut) || extractJsonObject(JSON.stringify(modelResp)) || null;
+    if (!obj) return {};
+
+    return normalizeResult(obj);
+  } catch {
+    // MUST NOT THROW
+    return {};
   }
-
-  const abandonedPayload = {
-    event_type: "ABANDONED",
-    lead_decision: "ABANDONED",
-    ...basePayload,
-    decision_reason: gateResult
-  };
-
-  try {
-    await senders.sendAbandoned(abandonedPayload);
-  } catch (e) {
-    log.error("ABANDONED webhook failed", e?.message || e);
-  }
-
-  return { status: "ok", event: "ABANDONED" };
 }
 
-module.exports = { finalizePipeline };
+module.exports = { parseLeadPostcall };
